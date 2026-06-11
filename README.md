@@ -6,7 +6,7 @@ Define your structs, declare the field mapping, and deserialize or serialize wit
 
 ## Performance
 
-Benchmarked against [pugixml](https://pugixml.org/) on identical workloads. Both libraries populate similar outputs, attempting to be as fair as possible.
+Benchmarked against [pugixml](https://pugixml.org/) on identical workloads. Both libraries populate similar outputs, attempting to be as fair as possible. Benchmarked on Ubuntu 24.04 with an AMD Ryzen 9 7950X3D 16-Core Processor, 32 GB DDR5 RAM. 
 
 | Workload | TurboXML | pugixml | Speedup |
 |---|---|---|---|
