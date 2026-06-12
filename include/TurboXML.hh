@@ -98,12 +98,23 @@ using AttrField = FieldBase<FieldKind::Attr, C, M>;
 template <typename C, typename M>
 using ContainerField = FieldBase<FieldKind::Container, C, M>;
 
+namespace detail {
+
+/// @brief Shared factory behind field/attr_field/vec_field/arr_field.
+template <FieldKind K, typename C, typename M>
+constexpr auto make_field(std::string_view name, M C::* m)
+    -> FieldBase<K, C, M> {
+  return {name, m, hash_field_name(name)};
+}
+
+}  // namespace detail
+
 /// @brief Creates an element field descriptor.
 /// @param name XML element name.
 /// @param m    Pointer to the target member.
 template <typename C, typename M>
 constexpr auto field(std::string_view name, M C::* m) -> Field<C, M> {
-  return {name, m, detail::hash_field_name(name)};
+  return detail::make_field<FieldKind::Element>(name, m);
 }
 
 /// @brief Creates an attribute field descriptor.
@@ -111,7 +122,7 @@ constexpr auto field(std::string_view name, M C::* m) -> Field<C, M> {
 /// @param m    Pointer to the target member.
 template <typename C, typename M>
 constexpr auto attr_field(std::string_view name, M C::* m) -> AttrField<C, M> {
-  return {name, m, detail::hash_field_name(name)};
+  return detail::make_field<FieldKind::Attr>(name, m);
 }
 
 /// @brief Creates a container field descriptor for dynamic containers (e.g., std::vector).
@@ -120,7 +131,7 @@ constexpr auto attr_field(std::string_view name, M C::* m) -> AttrField<C, M> {
 template <typename C, typename M>
 constexpr auto vec_field(std::string_view name, M C::* m)
     -> ContainerField<C, M> {
-  return {name, m, detail::hash_field_name(name)};
+  return detail::make_field<FieldKind::Container>(name, m);
 }
 
 /// @brief Creates a container field descriptor for fixed containers (e.g., std::array).
@@ -129,7 +140,7 @@ constexpr auto vec_field(std::string_view name, M C::* m)
 template <typename C, typename M>
 constexpr auto arr_field(std::string_view name, M C::* m)
     -> ContainerField<C, M> {
-  return {name, m, detail::hash_field_name(name)};
+  return detail::make_field<FieldKind::Container>(name, m);
 }
 
 // Metadata + concepts
@@ -336,8 +347,10 @@ class Parser {
 
   void parse_name(std::string_view& prefix, std::string_view& local,
                   FieldHash& local_hash) noexcept {
+    prefix = {};
     if (at_end() || !is_name_start(*cur_)) [[unlikely]] {
       local = {};
+      local_hash = detail::kFnvOffset;
       return;
     }
     const char* start = cur_;
@@ -385,14 +398,7 @@ class Parser {
     }
   }
 
-  void consume() {
-    if (has_peek_) {
-      has_peek_ = false;
-    } else if (!next_from_source(current_token_)) {
-      return;
-    }
-    update_self_closing();
-  }
+  void consume() { std::ignore = next(); }
 
   // Branch-free consume when we know a peek() just succeeded.
   void consume_peeked() noexcept {
@@ -528,21 +534,6 @@ class Parser {
     }
   }
 
-  // Dispatch table entry: consume the peeked token, then delegate to
-  // read_field. Used only by the N>1 dispatch table.
-  template <typename T, size_t I>
-  static bool handle_element(Parser& p, T& obj, uint16_t depth,
-                             size_t* arr_fill) {
-    constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
-    if constexpr (f.kind == FieldKind::Attr) {
-      p.skip_current();
-      return true;
-    } else {
-      p.consume_peeked();
-      return read_field<T, I>(p, obj, depth, arr_fill);
-    }
-  }
-
   template <typename T, size_t I>
   static void apply_attr(Parser& p, T& obj) {
     constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
@@ -555,7 +546,7 @@ class Parser {
   static constexpr auto build_elem_dispatch(
       std::index_sequence<I...>) noexcept {
     using Handler = bool (*)(Parser&, T&, uint16_t, size_t*);
-    return std::array<Handler, sizeof...(I)>{&handle_element<T, I>...};
+    return std::array<Handler, sizeof...(I)>{&read_field<T, I>...};
   }
 
   template <typename T, size_t... I>
@@ -723,7 +714,7 @@ inline auto Parser::parse_element_open(Token& token) -> bool {
     skip_whitespace();
     const char quote = peek_char();
     if (quote != '"' && quote != '\'') {
-      return make_error(token, "quotes req");
+      return make_error(token, "expected quoted attribute value");
     }
     ++cur_;
     const char* val_start = cur_;
@@ -754,12 +745,25 @@ inline auto Parser::parse_element_close(Token& token) -> bool {
 template <typename T>
 inline auto Parser::parse_numeric(std::string_view text, T& out) noexcept
     -> bool {
-  if (text.empty()) {
+  if constexpr (std::same_as<T, bool>) {
+    // XML Schema boolean lexical space; std::from_chars has no bool overload.
+    if (text == "true" || text == "1") {
+      out = true;
+      return true;
+    }
+    if (text == "false" || text == "0") {
+      out = false;
+      return true;
+    }
     return false;
+  } else {
+    if (text.empty()) {
+      return false;
+    }
+    const auto result =
+        std::from_chars(text.data(), text.data() + text.size(), out);
+    return result.ec == std::errc() && result.ptr == text.data() + text.size();
   }
-  const auto result =
-      std::from_chars(text.data(), text.data() + text.size(), out);
-  return result.ec == std::errc() && result.ptr == text.data() + text.size();
 }
 
 template <typename T>
@@ -859,7 +863,7 @@ inline void Parser::skip_element() {
   if (last_self_closing_) {
     return;
   }
-  uint16_t depth = 1;
+  size_t depth = 1;
   while (depth > 0) {
     const Token* t = next();
     if (!t) {
@@ -929,7 +933,7 @@ inline auto Parser::pull(T& object, const uint16_t depth) -> bool {
 
   // Per-field fill counters for fixed containers. Only those entries are
   // touched; the compiler elides the rest.
-  size_t arr_fill[N != 0 ? N : 1]{};
+  std::array<size_t, (N != 0 ? N : 1)> arr_fill{};
 
   // Apply attribute fields only when the type actually has some.
   constexpr bool kHasAttrs = has_attr_fields<T>(kIdxSeq);
@@ -957,7 +961,7 @@ inline auto Parser::pull(T& object, const uint16_t depth) -> bool {
         constexpr auto& f = std::get<0>(XmlMetadata<T>::fields);
         if constexpr (f.kind != FieldKind::Attr) {
           if (try_begin_element(f.xml_name)) {
-            if (!read_field<T, 0>(*this, object, depth, arr_fill)) {
+            if (!read_field<T, 0>(*this, object, depth, arr_fill.data())) {
               return false;
             }
             continue;
@@ -982,28 +986,15 @@ inline auto Parser::pull(T& object, const uint16_t depth) -> bool {
       continue;
     }
 
-    if constexpr (N == 1) {
-      // Inlined N==1 dispatch: direct hash compare, no function pointer.
-      constexpr auto& f = std::get<0>(XmlMetadata<T>::fields);
-      if (token->name_hash == f.hash) {
-        consume_peeked();
-        if (!read_field<T, 0>(*this, object, depth, arr_fill)) {
-          return false;
-        }
-      } else {
-        skip_current();
-      }
-    } else {
-      // N>1: dispatch table lookup.
-      static constexpr auto dispatch = build_elem_dispatch<T>(kIdxSeq);
-      const size_t idx = detail::find_field_index<T>(token->name_hash);
-      if (idx >= N) {
-        skip_current();
-        continue;
-      }
-      if (!dispatch[idx](*this, object, depth, arr_fill)) {
-        return false;
-      }
+    static constexpr auto dispatch = build_elem_dispatch<T>(kIdxSeq);
+    const size_t idx = detail::find_field_index<T>(token->name_hash);
+    if (idx >= N) {
+      skip_current();
+      continue;
+    }
+    consume_peeked();
+    if (!dispatch[idx](*this, object, depth, arr_fill.data())) {
+      return false;
     }
   }
 }
@@ -1026,7 +1017,7 @@ class Serializer {
 
   void do_indent(int depth) {
     if constexpr (kPretty) {
-      for (int i = 0; i < depth; ++i) out_ += "  ";
+      out_.append(static_cast<size_t>(depth) * 2, ' ');
     }
   }
 
@@ -1034,41 +1025,33 @@ class Serializer {
     if constexpr (kPretty) out_ += '\n';
   }
 
-  static void escape_text(std::string& out, std::string_view s) {
+  // Escapes '&' and '<' always; attribute values additionally escape '"',
+  // text content escapes '>'.
+  template <bool kAttr>
+  static void escape(std::string& out, std::string_view s) {
     for (char c : s) {
-      switch (c) {
-        case '&':
-          out += "&amp;";
-          break;
-        case '<':
-          out += "&lt;";
-          break;
-        case '>':
-          out += "&gt;";
-          break;
-        default:
-          out += c;
-          break;
+      if (c == '&') {
+        out += "&amp;";
+      } else if (c == '<') {
+        out += "&lt;";
+      } else if (!kAttr && c == '>') {
+        out += "&gt;";
+      } else if (kAttr && c == '"') {
+        out += "&quot;";
+      } else {
+        out += c;
       }
     }
   }
 
-  static void escape_attr(std::string& out, std::string_view s) {
-    for (char c : s) {
-      switch (c) {
-        case '&':
-          out += "&amp;";
-          break;
-        case '<':
-          out += "&lt;";
-          break;
-        case '"':
-          out += "&quot;";
-          break;
-        default:
-          out += c;
-          break;
-      }
+  template <typename V>
+  static void append_arithmetic(std::string& out, V v) {
+    if constexpr (std::same_as<V, bool>) {
+      out += v ? "true" : "false";
+    } else {
+      char buf[32];
+      const auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
+      if (ec == std::errc()) out.append(buf, static_cast<size_t>(ptr - buf));
     }
   }
 
@@ -1078,11 +1061,9 @@ class Serializer {
     out_ += name;
     out_ += "=\"";
     if constexpr (XmlStringLike<V>) {
-      escape_attr(out_, v);
+      escape<true>(out_, v);
     } else {
-      char buf[32];
-      const auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
-      if (ec == std::errc()) out_.append(buf, static_cast<size_t>(ptr - buf));
+      append_arithmetic(out_, v);
     }
     out_ += '"';
   }
@@ -1094,11 +1075,9 @@ class Serializer {
     out_ += tag;
     out_ += '>';
     if constexpr (XmlStringLike<V>) {
-      escape_text(out_, v);
+      escape<false>(out_, v);
     } else {
-      char buf[32];
-      const auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), v);
-      if (ec == std::errc()) out_.append(buf, static_cast<size_t>(ptr - buf));
+      append_arithmetic(out_, v);
     }
     out_ += "</";
     out_ += tag;

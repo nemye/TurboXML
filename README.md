@@ -2,7 +2,7 @@
 
 A high-performance, header-only XML pull-parser, deserializer, and serializer for C++20.
 
-Define your structs, declare the field mapping, and deserialize or serialize without any code generation or required dependencies. The intent of TurboXML is to trade gains performance for compile-time work. The overall initial goal is not to be feature-rich, but to provide a simple API for getting XML formatted data into your applicaitons for processing as quickly as possible. 
+Define your structs, declare the field mapping, and deserialize or serialize without any code generation or required dependencies. The intent of TurboXML is to trade compile-time work for runtime performance. The goal is not to be feature-rich, but to provide a simple API for getting XML-formatted data into your applications for processing as quickly as possible.
 
 ## Performance
 
@@ -27,6 +27,11 @@ Benchmarked against [pugixml](https://pugixml.org/) on identical workloads. Both
 ## Quick Start
 
 ```cpp
+#include <iostream>
+#include <string>
+#include <string_view>
+#include <vector>
+
 #include "TurboXML.hh"
 
 struct Book {
@@ -68,7 +73,7 @@ int main() {
   xml::Parser parser{src};
   Catalog catalog;
   if (xml::deserialize(parser, "catalog", catalog)) {
-    catalog.books[0].title == "XML Developer's Guide"
+    std::cout << catalog.books[0].title << '\n';  // XML Developer's Guide
   }
 
   // Serialize back to XML
@@ -90,6 +95,7 @@ int main() {
 
 ### Supported Member Types
 - **Primitives**: `int`, `unsigned`, `long`, `float`, `double`, and other arithmetic types
+- **Booleans**: `bool`, parsed from `true`/`false`/`1`/`0`, serialized as `true`/`false`
 - **Strings**: `std::string_view` (zero-copy, must outlive source), `std::string` (owning copy)
 - **Nested objects**: any type with an `XmlMetadata` specialization
 - **Dynamic containers**: `std::vector<T>` via `vec_field`
@@ -198,14 +204,17 @@ Copy `include/TurboXML.hh` into your project. No build step required.
 
 ```cmake
 add_subdirectory(TurboXML)
-target_link_libraries(my_target PRIVATE TurboXML::xmldeserializer)
+target_link_libraries(my_target PRIVATE TurboXML::turboxml)
 ```
 
 ## Project Layout
 
 ```
 ├── CMakeLists.txt
+├── LICENSE
 ├── README.md
+├── build.sh
+├── clean.sh
 ├── include/
 │   └── TurboXML.hh
 ├── test/

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(TurboXML
-    VERSION 1.0.1
+    VERSION 1.1.0
     LANGUAGES CXX
     DESCRIPTION "High-performance XML pull-parser for C++20"
 )
@@ -101,8 +101,9 @@ endif()
 
 # Installation
 set(INSTALL_DIR "${CMAKE_SOURCE_DIR}/bin")
-install(TARGETS 
-    turboxml_tests
-    turboxml_bench
-DESTINATION ${INSTALL_DIR})
+foreach(_target turboxml_tests turboxml_bench)
+    if(TARGET ${_target})
+        install(TARGETS ${_target} DESTINATION ${INSTALL_DIR})
+    endif()
+endforeach()
 message(STATUS "Installing binaries to ${INSTALL_DIR}")

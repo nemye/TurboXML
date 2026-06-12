@@ -319,6 +319,20 @@ struct xml::XmlMetadata<FixedSkills> {
       std::make_tuple(xml::arr_field("Skill", &FixedSkills::items));
 };
 
+struct Toggle {
+  bool enabled{};
+  bool active{};
+  bool verbose{};
+};
+
+template <>
+struct xml::XmlMetadata<Toggle> {
+  static constexpr auto fields =
+      std::make_tuple(xml::attr_field("enabled", &Toggle::enabled),
+                      xml::field("active", &Toggle::active),
+                      xml::field("verbose", &Toggle::verbose));
+};
+
 struct MixedRecord {
   int id{};
   std::string_view name;

@@ -1121,36 +1121,6 @@ TEST_F(XmlParserTest, MultipleProcessingInstructions) {
   EXPECT_EQ(person.name, "Bob");
 }
 
-/// @brief Long comments interleaved with elements must be fully skipped,
-/// with all data fields parsed correctly - mirrors the comment-heavy
-/// benchmark workload.
-TEST_F(XmlParserTest, CommentHeavyParsingCorrectness) {
-  // Build a payload with long comments (~500 bytes each) between elements.
-  const std::string filler(480, '=');
-  std::string xml_src = "<Users>\n";
-  for (int i = 0; i < 20; ++i) {
-    xml_src += "  <!-- comment " + std::to_string(i) + " " + filler + " -->\n";
-    xml_src += "  <User id=\"" + std::to_string(i + 1) + "\">\n";
-    xml_src += "    <Name>User " + std::to_string(i + 1) + "</Name>\n";
-    xml_src += "    <Email>u" + std::to_string(i + 1) + "@test.com</Email>\n";
-    xml_src += "  </User>\n";
-  }
-  // Trailing comment after the last element.
-  xml_src += "  <!-- final trailing comment " + filler + " -->\n";
-  xml_src += "</Users>";
-
-  xml::Parser parser{xml_src};
-  Users users;
-  ASSERT_TRUE(xml::deserialize(parser, "Users", users));
-  ASSERT_EQ(users.items.size(), 20U);
-
-  for (size_t i = 0; i < 20; ++i) {
-    EXPECT_EQ(users.items[i].id, i + 1);
-    EXPECT_EQ(users.items[i].name, "User " + std::to_string(i + 1));
-    EXPECT_EQ(users.items[i].email, "u" + std::to_string(i + 1) + "@test.com");
-  }
-}
-
 /// @brief Comments containing dashes and near-miss delimiters must not
 /// cause premature termination of the comment scan.
 TEST_F(XmlParserTest, CommentWithNearMissDelimiters) {
@@ -1180,6 +1150,8 @@ TEST_F(XmlParserTest, CommentHeavyPayloadParsesCorrectly) {
     xml += "    <Email>u" + std::to_string(i) + "@e.com</Email>\n";
     xml += "  </User>\n";
   }
+  // Trailing comment after the last element.
+  xml += "  <!-- final trailing comment " + filler + " -->\n";
   xml += "</Users>";
 
   xml::Parser parser{xml};
@@ -1359,6 +1331,75 @@ TEST_F(XmlParserTest, ArrFieldMixedOverflow) {
   EXPECT_EQ(rec.scores[1], 2);
   EXPECT_EQ(rec.scores[2], 3);
   EXPECT_EQ(rec.scores[3], 4);
+}
+
+// ---- bool fields ----
+
+/// @brief Bool fields accept the XML Schema boolean lexical space
+/// ("true", "false", "1", "0") as both attributes and elements.
+TEST_F(XmlParserTest, BoolFieldsAllLexicalForms) {
+  {
+    constexpr std::string_view xml_src =
+        R"(<Toggle enabled="true"><active>1</active><verbose>false</verbose></Toggle>)";
+    xml::Parser parser{xml_src};
+    Toggle t;
+    ASSERT_TRUE(xml::deserialize(parser, "Toggle", t));
+    EXPECT_TRUE(t.enabled);
+    EXPECT_TRUE(t.active);
+    EXPECT_FALSE(t.verbose);
+  }
+  {
+    constexpr std::string_view xml_src =
+        R"(<Toggle enabled="0"><active>false</active><verbose>true</verbose></Toggle>)";
+    xml::Parser parser{xml_src};
+    Toggle t;
+    t.enabled = true;
+    ASSERT_TRUE(xml::deserialize(parser, "Toggle", t));
+    EXPECT_FALSE(t.enabled);
+    EXPECT_FALSE(t.active);
+    EXPECT_TRUE(t.verbose);
+  }
+}
+
+/// @brief Invalid bool element text fails the parse, mirroring numeric fields.
+TEST_F(XmlParserTest, BoolFieldRejectsInvalidText) {
+  constexpr std::string_view xml_src =
+      R"(<Toggle enabled="1"><active>yes</active></Toggle>)";
+  xml::Parser parser{xml_src};
+  Toggle t;
+  EXPECT_FALSE(xml::deserialize(parser, "Toggle", t));
+}
+
+/// @brief An unparseable bool attribute leaves the default value, consistent
+/// with how numeric attributes fail silently.
+TEST_F(XmlParserTest, BoolAttrInvalidLeavesDefault) {
+  constexpr std::string_view xml_src =
+      R"(<Toggle enabled="maybe"><active>1</active><verbose>0</verbose></Toggle>)";
+  xml::Parser parser{xml_src};
+  Toggle t;
+  ASSERT_TRUE(xml::deserialize(parser, "Toggle", t));
+  EXPECT_FALSE(t.enabled);
+  EXPECT_TRUE(t.active);
+  EXPECT_FALSE(t.verbose);
+}
+
+/// @brief Bools serialize as "true"/"false" and round-trip.
+TEST_F(XmlParserTest, SerializerBoolRoundTrip) {
+  Toggle t;
+  t.enabled = true;
+  t.active = false;
+  t.verbose = true;
+
+  const std::string xml = xml::serialize("Toggle", t);
+  EXPECT_NE(xml.find("enabled=\"true\""), std::string::npos);
+  EXPECT_NE(xml.find("<active>false</active>"), std::string::npos);
+
+  xml::Parser parser{xml};
+  Toggle out;
+  ASSERT_TRUE(xml::deserialize(parser, "Toggle", out));
+  EXPECT_TRUE(out.enabled);
+  EXPECT_FALSE(out.active);
+  EXPECT_TRUE(out.verbose);
 }
 
 // ---- Serializer ----
