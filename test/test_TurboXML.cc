@@ -1333,6 +1333,68 @@ TEST_F(XmlParserTest, ArrFieldMixedOverflow) {
   EXPECT_EQ(rec.scores[3], 4);
 }
 
+// ---- document-order hint fast path ----
+
+/// @brief An unknown element whose name extends a mapped field's name
+/// ("titles" vs "title") must not be matched by the document-order fast
+/// path; it is skipped and all mapped siblings parse correctly.
+TEST_F(XmlParserTest, UnknownPrefixNamedSiblingIsSkipped) {
+  constexpr std::string_view xml_src = R"(
+<FlatList>
+  <Item id="1">
+    <titles>fake</titles>
+    <title>Real</title>
+    <desc>D</desc>
+    <status>2</status>
+  </Item>
+</FlatList>)";
+  xml::Parser parser{xml_src};
+  FlatList list;
+  ASSERT_TRUE(xml::deserialize(parser, "FlatList", list));
+  ASSERT_EQ(list.items.size(), 1U);
+  EXPECT_EQ(list.items[0].id, 1);
+  EXPECT_EQ(list.items[0].title, "Real");
+  EXPECT_EQ(list.items[0].description, "D");
+  EXPECT_EQ(list.items[0].status, 2);
+}
+
+/// @brief Fields arriving out of metadata order across consecutive items
+/// must parse correctly, including when document order is later restored
+/// (exercises hint misses and re-synchronisation).
+TEST_F(XmlParserTest, OutOfOrderThenInOrderItems) {
+  constexpr std::string_view xml_src = R"(
+<FlatList>
+  <Item id="1">
+    <status>5</status>
+    <title>A</title>
+    <desc>da</desc>
+  </Item>
+  <Item id="2">
+    <desc>db</desc>
+    <status>6</status>
+    <title>B</title>
+  </Item>
+  <Item id="3">
+    <title>C</title>
+    <desc>dc</desc>
+    <status>7</status>
+  </Item>
+</FlatList>)";
+  xml::Parser parser{xml_src};
+  FlatList list;
+  ASSERT_TRUE(xml::deserialize(parser, "FlatList", list));
+  ASSERT_EQ(list.items.size(), 3U);
+  EXPECT_EQ(list.items[0].title, "A");
+  EXPECT_EQ(list.items[0].description, "da");
+  EXPECT_EQ(list.items[0].status, 5);
+  EXPECT_EQ(list.items[1].title, "B");
+  EXPECT_EQ(list.items[1].description, "db");
+  EXPECT_EQ(list.items[1].status, 6);
+  EXPECT_EQ(list.items[2].title, "C");
+  EXPECT_EQ(list.items[2].description, "dc");
+  EXPECT_EQ(list.items[2].status, 7);
+}
+
 // ---- bool fields ----
 
 /// @brief Bool fields accept the XML Schema boolean lexical space

@@ -230,6 +230,65 @@ inline size_t find_field_index(FieldHash hash) noexcept {
   return static_cast<size_t>(std::distance(hashes.begin(), it));
 }
 
+template <typename T, size_t... I>
+constexpr auto make_field_names_impl(std::index_sequence<I...>) noexcept {
+  return std::array<std::string_view, sizeof...(I)>{
+      {std::get<I>(XmlMetadata<T>::fields).xml_name...}};
+}
+
+template <typename T>
+constexpr auto make_field_names() noexcept {
+  return make_field_names_impl<T>(
+      std::make_index_sequence<
+          std::tuple_size_v<decltype(XmlMetadata<T>::fields)>>{});
+}
+
+template <typename T, size_t... I>
+constexpr auto make_field_kinds_impl(std::index_sequence<I...>) noexcept {
+  return std::array<FieldKind, sizeof...(I)>{
+      {std::get<I>(XmlMetadata<T>::fields).kind...}};
+}
+
+template <typename T>
+constexpr auto make_field_kinds() noexcept {
+  return make_field_kinds_impl<T>(
+      std::make_index_sequence<
+          std::tuple_size_v<decltype(XmlMetadata<T>::fields)>>{});
+}
+
+/// @brief Index of the first non-attribute field, or 0 if none.
+template <typename T>
+constexpr auto first_elem_index() noexcept -> size_t {
+  constexpr auto kinds = make_field_kinds<T>();
+  for (size_t i = 0; i < kinds.size(); ++i) {
+    if (kinds[i] != FieldKind::Attr) {
+      return i;
+    }
+  }
+  return 0;
+}
+
+/// @brief Cyclic successor table over non-attribute fields: entry i holds
+/// the index of the next element/container field after i (itself if it is
+/// the only one). Drives the document-order hint in Parser::pull().
+template <typename T>
+constexpr auto make_next_elem_table() noexcept {
+  constexpr auto kinds = make_field_kinds<T>();
+  constexpr size_t n = kinds.size();
+  std::array<size_t, (n != 0 ? n : 1)> next{};
+  for (size_t i = 0; i < n; ++i) {
+    next[i] = i;
+    for (size_t step = 1; step <= n; ++step) {
+      const size_t j = (i + step) % n;
+      if (kinds[j] != FieldKind::Attr) {
+        next[i] = j;
+        break;
+      }
+    }
+  }
+  return next;
+}
+
 // Compile-time check that no two field names in a type produce the same
 // FNV-1a hash. Fires via static_assert in pull() for every deserialized type.
 template <size_t N>
@@ -558,6 +617,12 @@ class Parser {
   static constexpr bool has_attr_fields(std::index_sequence<I...>) noexcept {
     return (... ||
             (std::get<I>(XmlMetadata<T>::fields).kind == FieldKind::Attr));
+  }
+
+  template <typename T, size_t... I>
+  static constexpr bool has_elem_fields(std::index_sequence<I...>) noexcept {
+    return (... ||
+            (std::get<I>(XmlMetadata<T>::fields).kind != FieldKind::Attr));
   }
 
   template <typename T>
@@ -945,6 +1010,15 @@ inline auto Parser::pull(T& object, const uint16_t depth) -> bool {
     return true;
   }
 
+  // Document-order hint: index of the field expected next. Schema-ordered
+  // XML hits the memcmp fast path below on every element; out-of-order
+  // documents miss once, re-sync at the dispatch site, and stay correct.
+  constexpr bool kHasElems = has_elem_fields<T>(kIdxSeq);
+  static constexpr auto dispatch = build_elem_dispatch<T>(kIdxSeq);
+  static constexpr auto kNames = detail::make_field_names<T>();
+  static constexpr auto kNextElem = detail::make_next_elem_table<T>();
+  [[maybe_unused]] size_t hint = detail::first_elem_index<T>();
+
   while (true) {
     if (!has_peek_) {
       skip_whitespace();
@@ -955,17 +1029,23 @@ inline auto Parser::pull(T& object, const uint16_t depth) -> bool {
         return true;
       }
 
-      // N==1 fast-path: match the expected open tag via memcmp,
-      // bypassing full tokenisation (parse_name, hash, peek machinery).
-      if constexpr (N == 1) {
-        constexpr auto& f = std::get<0>(XmlMetadata<T>::fields);
-        if constexpr (f.kind != FieldKind::Attr) {
-          if (try_begin_element(f.xml_name)) {
-            if (!read_field<T, 0>(*this, object, depth, arr_fill.data())) {
-              return false;
-            }
-            continue;
+      // Fast path: match the hinted open tag via memcmp, bypassing full
+      // tokenisation (parse_name, hash, peek machinery).
+      if constexpr (kHasElems && N == 1) {
+        // Single-field types: compile-time tag name and direct call.
+        if (try_begin_element(kNames[0])) {
+          if (!read_field<T, 0>(*this, object, depth, arr_fill.data())) {
+            return false;
           }
+          continue;
+        }
+      } else if constexpr (kHasElems) {
+        if (try_begin_element(kNames[hint])) {
+          if (!dispatch[hint](*this, object, depth, arr_fill.data())) {
+            return false;
+          }
+          hint = kNextElem[hint];
+          continue;
         }
       }
 
@@ -986,7 +1066,6 @@ inline auto Parser::pull(T& object, const uint16_t depth) -> bool {
       continue;
     }
 
-    static constexpr auto dispatch = build_elem_dispatch<T>(kIdxSeq);
     const size_t idx = detail::find_field_index<T>(token->name_hash);
     if (idx >= N) {
       skip_current();
@@ -995,6 +1074,9 @@ inline auto Parser::pull(T& object, const uint16_t depth) -> bool {
     consume_peeked();
     if (!dispatch[idx](*this, object, depth, arr_fill.data())) {
       return false;
+    }
+    if constexpr (kHasElems && N > 1) {
+      hint = kNextElem[idx];
     }
   }
 }
