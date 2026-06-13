@@ -127,6 +127,32 @@ static auto GenerateCommentHeavyXml(size_t count) -> std::string {
   return xml;
 }
 
+static auto GenerateUnknownHeavyXml(size_t count) -> std::string {
+  // Each User carries a large unmapped <Meta> subtree the parser must skip:
+  // nested elements, attributes (including a quoted '>'), comments, CDATA.
+  std::string xml = "<?xml version=\"1.0\"?>\n<Users>\n";
+  xml.reserve(count * 700);
+  for (size_t i = 0; i < count; ++i) {
+    const std::string idx = std::to_string(i);
+    xml += "  <User id=\"" + idx + "\">\n";
+    xml += "    <Name>User " + idx + "</Name>\n";
+    xml += "    <Meta source=\"import\" rev=\"4\">\n";
+    xml += "      <Created by=\"sys\">2026-01-01T00:00:00Z</Created>\n";
+    xml += "      <Tags><Tag v=\"a\"/><Tag v=\"b\"/><Tag v=\"c\"/></Tags>\n";
+    xml += "      <Note label=\"x > y\">free text of moderate length here";
+    xml += " to give the scanner something to chew on</Note>\n";
+    xml += "      <!-- audit: imported > converted -->\n";
+    xml += "      <![CDATA[ raw <blob> data ]]>\n";
+    xml += "      <Nested><Deep><Deeper attr=\"q\">zzz</Deeper></Deep>";
+    xml += "</Nested>\n";
+    xml += "    </Meta>\n";
+    xml += "    <Email>u" + idx + "@e.com</Email>\n";
+    xml += "  </User>\n";
+  }
+  xml += "</Users>";
+  return xml;
+}
+
 // Pre-generate payloads
 const std::string kFlatXml = GenerateFlatXml(2000);
 const std::string kDeepXml = GenerateDeepXml(2000);
@@ -136,6 +162,7 @@ const std::string kLargeXml = GenerateLargeXml(10000);
 const std::string kOrgXml = GenerateOrgXml(20, 10);
 const std::string kTreeXml = GenerateTreeXml(14, 2);
 const std::string kCommentXml = GenerateCommentHeavyXml(1000);
+const std::string kUnknownXml = GenerateUnknownHeavyXml(2000);
 static const std::string kCatalogXml = R"(<?xml version="1.0"?>
 <catalog>
    <book id="bk101">
@@ -361,6 +388,19 @@ static void BM_ParseCommentHeavyXml(benchmark::State& state) {
                           static_cast<int64_t>(kCommentXml.size()));
 }
 
+static void BM_ParseUnknownHeavyXml(benchmark::State& state) {
+  for (auto _ : state) {
+    xml::Parser parser{kUnknownXml};
+    Users users;
+    bool ok = xml::deserialize(parser, "Users", users);
+    benchmark::DoNotOptimize(ok);
+    benchmark::DoNotOptimize(users);
+    benchmark::ClobberMemory();
+  }
+  state.SetBytesProcessed(state.iterations() *
+                          static_cast<int64_t>(kUnknownXml.size()));
+}
+
 static void BM_ParseCatalog(benchmark::State& state) {
   for (auto _ : state) {
     xml::Parser parser{kCatalogXml};
@@ -382,6 +422,7 @@ BENCHMARK(BM_ParseLargeXml);
 BENCHMARK(BM_ParseOrgXml);
 BENCHMARK(BM_ParseTreeXml);
 BENCHMARK(BM_ParseCommentHeavyXml);
+BENCHMARK(BM_ParseUnknownHeavyXml);
 BENCHMARK(BM_ParseCatalog);
 
 #ifdef TURBOXML_HAS_PUGIXML

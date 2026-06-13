@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0 — 2026-06-12
+
+Performance release. No API changes.
+
+### Changed
+- Document-order field hint: the opening-tag byte-compare fast path now covers all types, skipping tokenization and field lookup for schema-ordered XML (+18-47% throughput on element-heavy workloads).
+- Document-order attribute cursor: attribute fields match at a running cursor instead of per-field linear scans (+8% on attribute-heavy workloads).
+- Raw skip scanner: unmapped subtrees are skipped with a quote/comment/CDATA-aware byte scan instead of full tokenization (+19% on unknown-heavy content; new benchmark added).
+
 ## 1.1.0 — 2026-06-12
 
 ### Added

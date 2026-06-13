@@ -506,6 +506,47 @@ TEST_F(XmlParserTest, SkipsDeepUnknownSubtree) {
   EXPECT_EQ(person.age, 30);
 }
 
+/// @brief Unknown subtrees containing quoted '>' and "/>" in attribute
+/// values, comments and CDATA with markup-like content, PIs, and
+/// self-closing tags must be skipped without desyncing the parse.
+TEST_F(XmlParserTest, SkipsUnknownSubtreeWithTrickyContent) {
+  constexpr std::string_view xml_src = R"(
+<person>
+  <name>Alice</name>
+  <unknown a="x > y" b='gt > inside'>
+    <!-- comment with > and "quotes" and <tags> -->
+    <![CDATA[ raw <blob/> with ]] almost-terminators ]]>
+    <?pi target with > inside ?>
+    <child attr="/>">text</child>
+    <selfclosed x="y"/>
+  </unknown>
+  <age>30</age>
+</person>)";
+  xml::Parser parser{xml_src};
+  Person person;
+  ASSERT_TRUE(xml::deserialize(parser, "person", person));
+  EXPECT_EQ(person.name, "Alice");
+  EXPECT_EQ(person.age, 30);
+}
+
+/// @brief Input truncated inside an unknown subtree must fail the parse.
+TEST_F(XmlParserTest, TruncatedUnknownSubtreeFails) {
+  constexpr std::string_view xml_src = R"(<person><unknown><a><b>deep)";
+  xml::Parser parser{xml_src};
+  Person person;
+  EXPECT_FALSE(xml::deserialize(parser, "person", person));
+}
+
+/// @brief An unterminated attribute quote inside an unknown subtree must
+/// fail the parse rather than scan past the document end.
+TEST_F(XmlParserTest, UnterminatedQuoteInUnknownSubtreeFails) {
+  constexpr std::string_view xml_src =
+      R"(<person><unknown><a attr="broken></a></unknown><name>X</name></person>)";
+  xml::Parser parser{xml_src};
+  Person person;
+  EXPECT_FALSE(xml::deserialize(parser, "person", person));
+}
+
 TEST_F(XmlParserTest, SingleQuotedAttributes) {
   constexpr std::string_view xml_src =
       R"(<Users><User id='123'></User></Users>)";
@@ -1045,6 +1086,31 @@ TEST_F(XmlParserTest, FullAttrItemAllAttributesParsed) {
   EXPECT_EQ(item.s5, "five");
 }
 
+/// @brief Attributes arriving out of metadata order must still bind via the
+/// fallback scan (exercises the attribute document-order cursor miss path).
+TEST_F(XmlParserTest, OutOfOrderAttributesParsed) {
+  constexpr std::string_view xml_src = R"(
+<AttrList>
+  <Item s5="five" a1="10" s1="one" a5="50" a2="20"
+        s2="two" a3="30" s4="four" a4="40" s3="three"/>
+</AttrList>)";
+  xml::Parser parser{xml_src};
+  AttrList list;
+  ASSERT_TRUE(xml::deserialize(parser, "AttrList", list));
+  ASSERT_EQ(list.items.size(), 1U);
+  const auto& item = list.items[0];
+  EXPECT_EQ(item.a1, 10);
+  EXPECT_EQ(item.a2, 20);
+  EXPECT_EQ(item.a3, 30);
+  EXPECT_EQ(item.a4, 40);
+  EXPECT_EQ(item.a5, 50);
+  EXPECT_EQ(item.s1, "one");
+  EXPECT_EQ(item.s2, "two");
+  EXPECT_EQ(item.s3, "three");
+  EXPECT_EQ(item.s4, "four");
+  EXPECT_EQ(item.s5, "five");
+}
+
 /// @brief FlatItem: mixed attrs + child elements.
 TEST_F(XmlParserTest, FlatListParsing) {
   constexpr std::string_view xml_src = R"(
@@ -1331,6 +1397,68 @@ TEST_F(XmlParserTest, ArrFieldMixedOverflow) {
   EXPECT_EQ(rec.scores[1], 2);
   EXPECT_EQ(rec.scores[2], 3);
   EXPECT_EQ(rec.scores[3], 4);
+}
+
+// ---- document-order hint fast path ----
+
+/// @brief An unknown element whose name extends a mapped field's name
+/// ("titles" vs "title") must not be matched by the document-order fast
+/// path; it is skipped and all mapped siblings parse correctly.
+TEST_F(XmlParserTest, UnknownPrefixNamedSiblingIsSkipped) {
+  constexpr std::string_view xml_src = R"(
+<FlatList>
+  <Item id="1">
+    <titles>fake</titles>
+    <title>Real</title>
+    <desc>D</desc>
+    <status>2</status>
+  </Item>
+</FlatList>)";
+  xml::Parser parser{xml_src};
+  FlatList list;
+  ASSERT_TRUE(xml::deserialize(parser, "FlatList", list));
+  ASSERT_EQ(list.items.size(), 1U);
+  EXPECT_EQ(list.items[0].id, 1);
+  EXPECT_EQ(list.items[0].title, "Real");
+  EXPECT_EQ(list.items[0].description, "D");
+  EXPECT_EQ(list.items[0].status, 2);
+}
+
+/// @brief Fields arriving out of metadata order across consecutive items
+/// must parse correctly, including when document order is later restored
+/// (exercises hint misses and re-synchronisation).
+TEST_F(XmlParserTest, OutOfOrderThenInOrderItems) {
+  constexpr std::string_view xml_src = R"(
+<FlatList>
+  <Item id="1">
+    <status>5</status>
+    <title>A</title>
+    <desc>da</desc>
+  </Item>
+  <Item id="2">
+    <desc>db</desc>
+    <status>6</status>
+    <title>B</title>
+  </Item>
+  <Item id="3">
+    <title>C</title>
+    <desc>dc</desc>
+    <status>7</status>
+  </Item>
+</FlatList>)";
+  xml::Parser parser{xml_src};
+  FlatList list;
+  ASSERT_TRUE(xml::deserialize(parser, "FlatList", list));
+  ASSERT_EQ(list.items.size(), 3U);
+  EXPECT_EQ(list.items[0].title, "A");
+  EXPECT_EQ(list.items[0].description, "da");
+  EXPECT_EQ(list.items[0].status, 5);
+  EXPECT_EQ(list.items[1].title, "B");
+  EXPECT_EQ(list.items[1].description, "db");
+  EXPECT_EQ(list.items[1].status, 6);
+  EXPECT_EQ(list.items[2].title, "C");
+  EXPECT_EQ(list.items[2].description, "dc");
+  EXPECT_EQ(list.items[2].status, 7);
 }
 
 // ---- bool fields ----
