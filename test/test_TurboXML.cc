@@ -1213,12 +1213,13 @@ TEST_F(TurboBasicTests, MultipleProcessingInstructions) {
   EXPECT_EQ(person.name, "Bob");
 }
 
-/// @brief Comments containing dashes and near-miss delimiters must not
-/// cause premature termination of the comment scan.
+/// @brief Comments containing isolated dashes and a "->" near-miss delimiter
+/// must not cause premature termination of the comment scan. (Interior "--"
+/// is a separate well-formedness error; see DoubleHyphenInsideCommentRejected.)
 TEST_F(TurboBasicTests, CommentWithNearMissDelimiters) {
   constexpr std::string_view xml_src = R"(
 <person>
-  <!-- tricky - dashes -- but not --> yet - still going -- almost -->
+  <!-- tricky - dashes -> not yet > still going - almost -->
   <name>Survived</name>
   <age>1</age>
 </person>)";
@@ -1227,6 +1228,17 @@ TEST_F(TurboBasicTests, CommentWithNearMissDelimiters) {
   ASSERT_TRUE(xml::deserialize(parser, "person", person));
   EXPECT_EQ(person.name, "Survived");
   EXPECT_EQ(person.age, 1);
+}
+
+/// @brief XML forbids "--" within a comment's content (WFC). TurboXML enforces
+/// this in a single scanning pass and reports MalformedComment.
+TEST_F(TurboBasicTests, DoubleHyphenInsideCommentRejected) {
+  constexpr std::string_view xml_src =
+      R"(<person><!-- bad -- comment --><name>X</name></person>)";
+  xml::Parser parser{xml_src};
+  Person person;
+  EXPECT_FALSE(xml::deserialize(parser, "person", person));
+  EXPECT_EQ(parser.error_code(), xml::ErrorCode::MalformedComment);
 }
 
 /// @brief Verifies that long comments interleaved with elements are
@@ -1715,4 +1727,345 @@ TEST_F(TurboBasicTests, SerializerRoundTripOrganization) {
   EXPECT_EQ(out.departments[0].teams[0].members[0].full_name, "Ada");
   ASSERT_EQ(out.departments[0].teams[0].members[0].skills.items.size(), 2U);
   EXPECT_EQ(out.departments[0].teams[0].members[0].skills.items[0], "C++");
+}
+
+// ---- Required fields (optional by default) ----
+
+struct ReqRecord {
+  int id{};               // required attribute
+  std::string_view name;  // required element
+  std::string_view note;  // optional element
+};
+
+template <>
+struct xml::XmlMetadata<ReqRecord> {
+  static constexpr auto fields = std::make_tuple(
+      xml::attr_field("id", &ReqRecord::id, /*required=*/true),
+      xml::field("name", &ReqRecord::name, /*required=*/true),
+      xml::field("note", &ReqRecord::note));
+};
+
+struct ReqList {
+  std::vector<std::string_view> items;  // required: at least one
+};
+
+template <>
+struct xml::XmlMetadata<ReqList> {
+  static constexpr auto fields = std::make_tuple(
+      xml::vec_field("item", &ReqList::items, /*required=*/true));
+};
+
+struct ReqParent {
+  ReqRecord child;  // required nested object
+};
+
+template <>
+struct xml::XmlMetadata<ReqParent> {
+  static constexpr auto fields = std::make_tuple(
+      xml::field("ReqRecord", &ReqParent::child, /*required=*/true));
+};
+
+/// @brief All required fields present, optional one absent -> success.
+TEST_F(TurboBasicTests, RequiredFieldsAllPresentOptionalAbsent) {
+  constexpr std::string_view xml_src =
+      R"(<ReqRecord id="7"><name>Ada</name></ReqRecord>)";
+  xml::Parser parser{xml_src};
+  ReqRecord rec;
+  ASSERT_TRUE(xml::deserialize(parser, "ReqRecord", rec));
+  EXPECT_EQ(rec.id, 7);
+  EXPECT_EQ(rec.name, "Ada");
+  EXPECT_TRUE(rec.note.empty());
+}
+
+/// @brief Optional field may also be present.
+TEST_F(TurboBasicTests, RequiredFieldsWithOptionalPresent) {
+  constexpr std::string_view xml_src =
+      R"(<ReqRecord id="7"><name>Ada</name><note>hi</note></ReqRecord>)";
+  xml::Parser parser{xml_src};
+  ReqRecord rec;
+  ASSERT_TRUE(xml::deserialize(parser, "ReqRecord", rec));
+  EXPECT_EQ(rec.note, "hi");
+}
+
+/// @brief Out-of-order required fields still satisfy the mask.
+TEST_F(TurboBasicTests, RequiredFieldsOutOfOrder) {
+  constexpr std::string_view xml_src =
+      R"(<ReqRecord id="7"><note>hi</note><name>Ada</name></ReqRecord>)";
+  xml::Parser parser{xml_src};
+  ReqRecord rec;
+  ASSERT_TRUE(xml::deserialize(parser, "ReqRecord", rec));
+  EXPECT_EQ(rec.name, "Ada");
+  EXPECT_EQ(rec.note, "hi");
+}
+
+/// @brief Missing a required child element -> MissingRequiredField.
+TEST_F(TurboBasicTests, MissingRequiredElementFails) {
+  constexpr std::string_view xml_src =
+      R"(<ReqRecord id="7"><note>hi</note></ReqRecord>)";
+  xml::Parser parser{xml_src};
+  ReqRecord rec;
+  EXPECT_FALSE(xml::deserialize(parser, "ReqRecord", rec));
+  EXPECT_EQ(parser.error_code(), xml::ErrorCode::MissingRequiredField);
+}
+
+/// @brief Missing a required attribute -> MissingRequiredField.
+TEST_F(TurboBasicTests, MissingRequiredAttributeFails) {
+  constexpr std::string_view xml_src =
+      R"(<ReqRecord><name>Ada</name></ReqRecord>)";
+  xml::Parser parser{xml_src};
+  ReqRecord rec;
+  EXPECT_FALSE(xml::deserialize(parser, "ReqRecord", rec));
+  EXPECT_EQ(parser.error_code(), xml::ErrorCode::MissingRequiredField);
+}
+
+/// @brief A self-closing element cannot satisfy a required child element,
+/// even though its required attribute is present.
+TEST_F(TurboBasicTests, SelfClosingMissingRequiredElementFails) {
+  constexpr std::string_view xml_src = R"(<ReqRecord id="7"/>)";
+  xml::Parser parser{xml_src};
+  ReqRecord rec;
+  EXPECT_FALSE(xml::deserialize(parser, "ReqRecord", rec));
+  EXPECT_EQ(parser.error_code(), xml::ErrorCode::MissingRequiredField);
+}
+
+/// @brief A required container with zero matching children fails.
+TEST_F(TurboBasicTests, RequiredContainerEmptyFails) {
+  constexpr std::string_view xml_src = R"(<ReqList></ReqList>)";
+  xml::Parser parser{xml_src};
+  ReqList list;
+  EXPECT_FALSE(xml::deserialize(parser, "ReqList", list));
+  EXPECT_EQ(parser.error_code(), xml::ErrorCode::MissingRequiredField);
+}
+
+/// @brief A required container with at least one child succeeds (exercises the
+/// N==1 fast-path bit set).
+TEST_F(TurboBasicTests, RequiredContainerNonEmptySucceeds) {
+  constexpr std::string_view xml_src =
+      R"(<ReqList><item>a</item><item>b</item></ReqList>)";
+  xml::Parser parser{xml_src};
+  ReqList list;
+  ASSERT_TRUE(xml::deserialize(parser, "ReqList", list));
+  ASSERT_EQ(list.items.size(), 2U);
+  EXPECT_EQ(list.items[0], "a");
+}
+
+/// @brief A required nested object that is absent fails at the parent level.
+TEST_F(TurboBasicTests, RequiredNestedObjectMissingFails) {
+  constexpr std::string_view xml_src = R"(<ReqParent></ReqParent>)";
+  xml::Parser parser{xml_src};
+  ReqParent p;
+  EXPECT_FALSE(xml::deserialize(parser, "ReqParent", p));
+  EXPECT_EQ(parser.error_code(), xml::ErrorCode::MissingRequiredField);
+}
+
+/// @brief A required nested object that is present but itself incomplete
+/// propagates MissingRequiredField from the inner pull().
+TEST_F(TurboBasicTests, RequiredNestedObjectIncompleteFails) {
+  constexpr std::string_view xml_src =
+      R"(<ReqParent><ReqRecord id="1"></ReqRecord></ReqParent>)";
+  xml::Parser parser{xml_src};
+  ReqParent p;
+  EXPECT_FALSE(xml::deserialize(parser, "ReqParent", p));
+  EXPECT_EQ(parser.error_code(), xml::ErrorCode::MissingRequiredField);
+}
+
+/// @brief A required nested object, fully populated, succeeds.
+TEST_F(TurboBasicTests, RequiredNestedObjectCompleteSucceeds) {
+  constexpr std::string_view xml_src =
+      R"(<ReqParent><ReqRecord id="1"><name>Ada</name></ReqRecord></ReqParent>)";
+  xml::Parser parser{xml_src};
+  ReqParent p;
+  ASSERT_TRUE(xml::deserialize(parser, "ReqParent", p));
+  EXPECT_EQ(p.child.id, 1);
+  EXPECT_EQ(p.child.name, "Ada");
+}
+
+// ---- Resource bounds (untrusted input) ----
+
+/// @brief Exactly kMaxAttributesPerElement attributes is accepted (boundary).
+TEST_F(TurboBasicTests, MaxAttributesBoundaryAccepted) {
+  std::string xml = "<User";
+  xml.reserve(xml::Parser::kMaxAttributesPerElement * 5 + 16);
+  for (size_t i = 0; i < xml::Parser::kMaxAttributesPerElement; ++i) {
+    xml += R"( a="")";
+  }
+  xml += "/>";
+  xml::Parser parser{xml};
+  User user;
+  EXPECT_TRUE(xml::deserialize(parser, "User", user));
+}
+
+/// @brief One attribute past the cap is rejected with TooManyAttributes.
+TEST_F(TurboBasicTests, TooManyAttributesRejected) {
+  std::string xml = "<User";
+  xml.reserve(xml::Parser::kMaxAttributesPerElement * 5 + 16);
+  for (size_t i = 0; i <= xml::Parser::kMaxAttributesPerElement; ++i) {
+    xml += R"( a="")";
+  }
+  xml += "/>";
+  xml::Parser parser{xml};
+  User user;
+  EXPECT_FALSE(xml::deserialize(parser, "User", user));
+  EXPECT_EQ(parser.error_code(), xml::ErrorCode::TooManyAttributes);
+}
+
+/// @brief A deeply nested *unknown* subtree beyond kMaxDepth is rejected by
+/// skip_element (depth parity with the recursive descent path) rather than
+/// silently skipped.
+TEST_F(TurboBasicTests, UnknownSubtreeDepthLimited) {
+  const int over = xml::Parser::kMaxDepth + 5;
+  std::string xml = "<person><name>A</name><unknown>";
+  for (int i = 0; i < over; ++i) {
+    xml += "<n>";
+  }
+  for (int i = 0; i < over; ++i) {
+    xml += "</n>";
+  }
+  xml += "</unknown><age>1</age></person>";
+  xml::Parser parser{xml};
+  Person person;
+  EXPECT_FALSE(xml::deserialize(parser, "person", person));
+  EXPECT_EQ(parser.error_code(), xml::ErrorCode::DepthExceeded);
+}
+
+// ---- Normalization & reference expansion (NormalizingParser, opt-in) ----
+//
+// Normalization is gated on BasicParser<true> (xml::NormalizingParser) and only
+// applies to owning std::string fields; std::string_view fields stay raw and
+// zero-copy. The default xml::Parser compiles these paths away entirely.
+
+struct NormRecord {
+  std::string body;      // element text: expanded + EOL-normalized
+  std::string attr;      // attribute value: expanded + whitespace-normalized
+  std::string_view raw;  // string_view stays raw even under normalization
+};
+
+template <>
+struct xml::XmlMetadata<NormRecord> {
+  static constexpr auto fields =
+      std::make_tuple(xml::attr_field("a", &NormRecord::attr),
+                      xml::field("body", &NormRecord::body),
+                      xml::field("raw", &NormRecord::raw));
+};
+
+struct NormText {
+  std::string v;
+};
+
+template <>
+struct xml::XmlMetadata<NormText> {
+  static constexpr auto fields = std::make_tuple(xml::field("v", &NormText::v));
+};
+
+/// @brief The five predefined entities expand in element text.
+TEST_F(TurboBasicTests, NormalizePredefinedEntities) {
+  constexpr std::string_view src =
+      R"(<NormText><v>a &amp; b &lt; c &gt; d &apos; e &quot; f</v></NormText>)";
+  xml::NormalizingParser p{src};
+  NormText t;
+  ASSERT_TRUE(xml::deserialize(p, "NormText", t));
+  EXPECT_EQ(t.v, "a & b < c > d ' e \" f");
+}
+
+/// @brief Decimal and hex character references expand, including a multi-byte
+/// code point encoded as UTF-8.
+TEST_F(TurboBasicTests, NormalizeCharacterReferences) {
+  constexpr std::string_view src =
+      R"(<NormText><v>&#65;&#x42;&#x2764;</v></NormText>)";
+  xml::NormalizingParser p{src};
+  NormText t;
+  ASSERT_TRUE(xml::deserialize(p, "NormText", t));
+  EXPECT_EQ(t.v, std::string("AB") + "\xE2\x9D\xA4");  // U+2764 HEAVY BLACK HEART
+}
+
+/// @brief CDATA content is copied literally: references inside it are NOT
+/// expanded, and it concatenates with surrounding text runs.
+TEST_F(TurboBasicTests, NormalizeCDataLiteralAndConcatenated) {
+  constexpr std::string_view src =
+      R"(<NormText><v>x &amp; <![CDATA[y &amp; z]]> w</v></NormText>)";
+  xml::NormalizingParser p{src};
+  NormText t;
+  ASSERT_TRUE(xml::deserialize(p, "NormText", t));
+  EXPECT_EQ(t.v, "x & y &amp; z w");
+}
+
+/// @brief CR and CRLF in element text normalize to a single LF; tabs survive.
+TEST_F(TurboBasicTests, NormalizeLineEndings) {
+  const std::string src = "<NormText><v>a\r\nb\rc\td</v></NormText>";
+  xml::NormalizingParser p{src};
+  NormText t;
+  ASSERT_TRUE(xml::deserialize(p, "NormText", t));
+  EXPECT_EQ(t.v, "a\nb\nc\td");
+}
+
+/// @brief Attribute values: literal whitespace (tab/newline) becomes a space,
+/// but whitespace introduced via a character reference is preserved literally.
+TEST_F(TurboBasicTests, NormalizeAttributeWhitespace) {
+  const std::string src =
+      "<NormRecord a=\"x\ty\nz&#9;w\"><body>b</body><raw>r</raw></NormRecord>";
+  xml::NormalizingParser p{src};
+  NormRecord r;
+  ASSERT_TRUE(xml::deserialize(p, "NormRecord", r));
+  EXPECT_EQ(r.attr, "x y z\tw");  // literal tab/LF -> space; &#9; stays a tab
+}
+
+/// @brief std::string_view fields are unaffected by normalization (raw bytes),
+/// even on the normalizing parser, while sibling std::string fields expand.
+TEST_F(TurboBasicTests, NormalizeLeavesStringViewRaw) {
+  constexpr std::string_view src =
+      R"(<NormRecord a="ok"><body>m &amp; n</body><raw>p &amp; q</raw></NormRecord>)";
+  xml::NormalizingParser p{src};
+  NormRecord r;
+  ASSERT_TRUE(xml::deserialize(p, "NormRecord", r));
+  EXPECT_EQ(r.body, "m & n");     // owning std::string -> expanded
+  EXPECT_EQ(r.raw, "p &amp; q");  // string_view -> raw, zero-copy
+}
+
+/// @brief The default parser performs no expansion: owning std::string fields
+/// receive raw bytes, preserving byte-for-byte fidelity (opt-in by design).
+TEST_F(TurboBasicTests, DefaultParserDoesNotNormalize) {
+  constexpr std::string_view src = R"(<NormText><v>a &amp; b</v></NormText>)";
+  xml::Parser p{src};
+  NormText t;
+  ASSERT_TRUE(xml::deserialize(p, "NormText", t));
+  EXPECT_EQ(t.v, "a &amp; b");
+}
+
+/// @brief An undefined entity (no DTD, not one of the five predefined) is a
+/// hard error on the normalizing path, in element text and in attributes.
+TEST_F(TurboBasicTests, NormalizeUndefinedEntityFailsInText) {
+  constexpr std::string_view src = R"(<NormText><v>a &bogus; b</v></NormText>)";
+  xml::NormalizingParser p{src};
+  NormText t;
+  EXPECT_FALSE(xml::deserialize(p, "NormText", t));
+  EXPECT_EQ(p.error_code(), xml::ErrorCode::UndefinedEntity);
+}
+
+TEST_F(TurboBasicTests, NormalizeUndefinedEntityFailsInAttribute) {
+  constexpr std::string_view src =
+      R"(<NormRecord a="x &bogus; y"><body>b</body><raw>r</raw></NormRecord>)";
+  xml::NormalizingParser p{src};
+  NormRecord r;
+  EXPECT_FALSE(xml::deserialize(p, "NormRecord", r));
+  EXPECT_EQ(p.error_code(), xml::ErrorCode::UndefinedEntity);
+}
+
+/// @brief A malformed or out-of-range character reference fails with
+/// InvalidCharRef.
+TEST_F(TurboBasicTests, NormalizeInvalidCharRefFails) {
+  constexpr std::string_view src = R"(<NormText><v>&#xZZ;</v></NormText>)";
+  xml::NormalizingParser p{src};
+  NormText t;
+  EXPECT_FALSE(xml::deserialize(p, "NormText", t));
+  EXPECT_EQ(p.error_code(), xml::ErrorCode::InvalidCharRef);
+}
+
+/// @brief A character reference to a code point outside the XML Char production
+/// (here NUL) is rejected as InvalidCharRef.
+TEST_F(TurboBasicTests, NormalizeForbiddenCodePointFails) {
+  constexpr std::string_view src = R"(<NormText><v>&#0;</v></NormText>)";
+  xml::NormalizingParser p{src};
+  NormText t;
+  EXPECT_FALSE(xml::deserialize(p, "NormText", t));
+  EXPECT_EQ(p.error_code(), xml::ErrorCode::InvalidCharRef);
 }

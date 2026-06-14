@@ -93,6 +93,19 @@ int main() {
 | `xml::vec_field("name", &T::member)` | Repeated element: appends each `<name>` to a dynamic container |
 | `xml::arr_field("name", &T::member)` | Repeated element: fills a fixed-capacity container sequentially; skips overflow |
 
+All four factories accept an optional trailing `required` flag (default `false`,
+i.e. fields are optional). When `true`, `deserialize()` fails with
+`ErrorCode::MissingRequiredField` if the element/attribute is absent (for
+containers, if no item is matched):
+
+```cpp
+xml::field("title", &Book::title, true)   // field must be present
+xml::attr_field("id", &Book::id, false)   // optional. Note that the parameter is not needed (default = false) 
+```
+
+Types with no required fields pay nothing for the check: presence tracking
+compiles away entirely.
+
 ### Supported Member Types
 - **Primitives**: `int`, `unsigned`, `long`, `float`, `double`, and other arithmetic types
 - **Booleans**: `bool`, parsed from `true`/`false`/`1`/`0`, serialized as `true`/`false`
@@ -172,6 +185,25 @@ xml::vec_field("point", &MyStruct::my_eigen_vec)  // or arr_field, both work
 ### Owning vs Zero-Copy
 
 Use `std::string_view` for maximum performance when the source buffer outlives the parsed objects. Use `std::string` when you need the data to persist independently. Both use the same `xml::field(...)` declaration and can be mixed in the same struct.
+
+### Normalization & Entity Expansion (opt-in)
+
+By default `xml::Parser` is zero-copy and **non-normalizing**: it does not expand entities or character references, normalize line endings, or normalize attribute values.
+
+For XML-conformant text, use `xml::NormalizingParser` (an alias for `xml::BasicParser<true>`). On this parser, **owning `std::string` fields** receive normalized, reference-expanded text:
+
+- The five predefined entities (`&amp; &lt; &gt; &apos; &quot;`) and decimal/hex character references (`&#65;`, `&#x41;`) are expanded (UTF-8 encoded).
+- Line endings (`\r\n`, `\r`) are normalized to `\n`.
+- Attribute whitespace (literal tab/newline) is normalized to spaces (XML §3.3.3); whitespace introduced via a reference is preserved.
+- CDATA content is copied literally (never reference-expanded) and concatenated with surrounding text.
+- An undefined entity (none of the five predefined; no DTD is processed) fails with `ErrorCode::UndefinedEntity`; a malformed or out-of-range character reference fails with `ErrorCode::InvalidCharRef`.
+
+```cpp
+xml::NormalizingParser p{src};
+xml::deserialize(p, "root", obj);   // std::string fields are normalized
+```
+
+`std::string_view` fields are **always** raw zero-copy and ignore this setting (a view cannot hold transformed bytes). The default `xml::Parser` compiles the normalization paths away entirely, meaning you pay nothing unless you opt in.
 
 ## Building
 

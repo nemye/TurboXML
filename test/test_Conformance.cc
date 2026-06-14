@@ -117,6 +117,16 @@ struct xml::XmlMetadata<OwnedLeaf> {
       std::make_tuple(xml::field("v", &OwnedLeaf::text));
 };
 
+struct OwnedAttr {
+  std::string x;
+};
+
+template <>
+struct xml::XmlMetadata<OwnedAttr> {
+  static constexpr auto fields =
+      std::make_tuple(xml::attr_field("x", &OwnedAttr::x));
+};
+
 // sec 2.1 - Well-Formed XML Documents [Production 1: document]
 class Sec2_1_WellFormedDocument : public ::testing::Test {};
 
@@ -196,7 +206,7 @@ TEST_F(Sec2_2_Characters, NulByteInContent) {
 /// Valid multi-byte UTF-8 characters in element names and content.
 /// NameStartChar allows [#xC0-#xD6] etc.
 TEST_F(Sec2_2_Characters, Utf8InElementNamesAndContent) {
-  // "café" as element name (é = U+00E9 → 0xC3 0xA9 in UTF-8)
+  // "café" as element name (é = U+00E9 -> 0xC3 0xA9 in UTF-8)
   constexpr std::string_view src = R"(<r><v>café</v></r>)";
   xml::Parser p{src};
   Leaf leaf;
@@ -346,35 +356,24 @@ TEST_F(Sec2_5_Comments, EmptyComment) {
 /// Production [15]: Comment ::= '<!--' ((Char - '-') | ('-' (Char - '-')))*
 /// '-->'
 ///
-/// XFAIL: TurboXML uses scan_to_delimiter("-->") which does not check
-/// for interior "--". It will accept "<!-- bad -- comment -->".
+/// TurboXML enforces this WFC: the comment scan rejects any interior "--"
+/// (the first "--" must begin the "-->" terminator).
 TEST_F(Sec2_5_Comments, DoubleHyphenInsideCommentShouldFail) {
   constexpr std::string_view src = R"(<!-- bad -- comment --><r><v>ok</v></r>)";
   xml::Parser p{src};
   Leaf leaf;
-  bool ok = xml::deserialize(p, "r", leaf);
-  if (ok) {
-    GTEST_SKIP() << "XFAIL sec 2.5: '--' inside comment not rejected "
-                    "(by design)";
-  } else {
-    SUCCEED();
-  }
+  EXPECT_FALSE(xml::deserialize(p, "r", leaf));
+  EXPECT_EQ(p.error_code(), xml::ErrorCode::MalformedComment);
 }
 
-/// Comment ending with "--->" is ill-formed (ends with '-' before '-->').
-///
-/// XFAIL: Same scan_to_delimiter limitation.
+/// Comment ending with "--->" is ill-formed: the content's trailing '-' is
+/// adjacent to the terminator's leading '-', forming a forbidden "--".
 TEST_F(Sec2_5_Comments, CommentEndingWithTripleHyphenShouldFail) {
   constexpr std::string_view src = R"(<!--- bad ---><r><v>ok</v></r>)";
   xml::Parser p{src};
   Leaf leaf;
-  bool ok = xml::deserialize(p, "r", leaf);
-  if (ok) {
-    GTEST_SKIP() << "XFAIL sec 2.5: '--->' comment terminator not rejected "
-                    "(by design)";
-  } else {
-    SUCCEED();
-  }
+  EXPECT_FALSE(xml::deserialize(p, "r", leaf));
+  EXPECT_EQ(p.error_code(), xml::ErrorCode::MalformedComment);
 }
 
 /// Unterminated comment - must fail.
@@ -412,10 +411,9 @@ TEST_F(Sec2_6_PI, PIBetweenElements) {
 /// Production [17]: PITarget ::= Name - (('X'|'x')('M'|'m')('L'|'l'))
 ///
 /// NOTE: TurboXML treats "<?xml ...?>" as TokenType::XmlDeclaration and
-/// any other PI target as TokenType::ProcessingInstruction. The parser
-/// doesn't specifically reject "<?XML ...?>" or "<?Xml ...?>" as
-/// illegal PI targets - it only checks exact lowercase "xml". This is
-/// a conformance gap for mixed-case variants.
+/// any other PI target as TokenType::ProcessingInstruction. A reserved
+/// case-variant of "xml" ("XML", "Xml", ...) is rejected as an illegal PI
+/// target (see PITargetXmlMixedCaseRejected).
 TEST_F(Sec2_6_PI, PITargetXmlLowercase) {
   // "<?xml ...?>" at the start is the XML declaration - legal.
   constexpr std::string_view src = R"(<?xml version="1.0"?><r><v>ok</v></r>)";
@@ -432,15 +430,10 @@ TEST_F(Sec2_6_PI, PITargetXmlMixedCaseRejected) {
   constexpr std::string_view src = R"(<?XML version="1.0"?><r><v>ok</v></r>)";
   xml::Parser p{src};
   Leaf leaf;
-  // Production 17 reserves every case variant of "xml", but TurboXML treats a
-  // non-exact-"xml" target as an ordinary PI (documented limitation).
-  bool ok = xml::deserialize(p, "r", leaf);
-  if (ok) {
-    GTEST_SKIP() << "XFAIL sec 2.6: mixed-case 'xml' PI target not rejected "
-                    "(by design)";
-  } else {
-    SUCCEED();
-  }
+  // Production 17 reserves every case variant of "xml"; TurboXML rejects a
+  // mixed-case "xml" PI target as ill-formed.
+  EXPECT_FALSE(xml::deserialize(p, "r", leaf));
+  EXPECT_EQ(p.error_code(), xml::ErrorCode::ReservedPiTarget);
 }
 
 /// A PI target that merely starts with "xml" (e.g. "xml-stylesheet") is a
@@ -581,33 +574,23 @@ TEST_F(Sec2_10_Whitespace, WhitespaceBetweenElements) {
 // sec 2.11 - End-of-Line Handling
 class Sec2_11_EOL : public ::testing::Test {};
 
-/// Per spec, \r\n → \n and bare \r → \n before any other processing.
-///
-/// XFAIL: TurboXML is a zero-copy parser and does not normalize line
-/// endings. The raw bytes are preserved in string_views.
+/// Per spec, \r\n -> \n and bare \r -> \n before any other processing. Applied
+/// on the normalizing parser for owning std::string fields; a zero-copy
+/// std::string_view necessarily preserves the raw bytes.
 TEST_F(Sec2_11_EOL, CrLfNormalization) {
   std::string src = "<r><v>line1\r\nline2</v></r>";
-  xml::Parser p{src};
-  Leaf leaf;
+  xml::NormalizingParser p{src};
+  OwnedLeaf leaf;
   ASSERT_TRUE(xml::deserialize(p, "r", leaf));
-  // Spec requires the \r\n to be normalized to \n.
-  if (leaf.text == "line1\r\nline2") {
-    GTEST_SKIP()
-        << "XFAIL sec 2.11: \\r\\n not normalized to \\n (zero-copy design)";
-  }
   EXPECT_EQ(leaf.text, "line1\nline2");
 }
 
-/// Bare \r → \n.
+/// Bare \r -> \n.
 TEST_F(Sec2_11_EOL, BareCarriageReturn) {
   std::string src = "<r><v>a\rb</v></r>";
-  xml::Parser p{src};
-  Leaf leaf;
+  xml::NormalizingParser p{src};
+  OwnedLeaf leaf;
   ASSERT_TRUE(xml::deserialize(p, "r", leaf));
-  if (leaf.text == "a\rb") {
-    GTEST_SKIP()
-        << "XFAIL sec 2.11: bare \\r not normalized to \\n (zero-copy design)";
-  }
   EXPECT_EQ(leaf.text, "a\nb");
 }
 
@@ -1216,50 +1199,32 @@ TEST_F(Robustness, GarbageAfterDocument) {
 class ConformanceGaps : public ::testing::Test {};
 
 /// sec 3.3.3 - Attribute-value normalization. For CDATA-typed attributes
-/// (the default without a DTD), processors should replace character
-/// references and entity references, then normalize whitespace.
-///
-/// XFAIL: TurboXML does not perform attribute-value normalization.
+/// (the default without a DTD), processors replace character/entity references,
+/// then normalize whitespace. Supported on the normalizing parser for owning
+/// std::string fields (a zero-copy std::string_view cannot hold the result).
 TEST_F(ConformanceGaps, AttrValueNormalization) {
   constexpr std::string_view src = R"(<r x="a&#x20;&#x20;b"/>)";
-  xml::Parser p{src};
-  AttrOnly ao;
+  xml::NormalizingParser p{src};
+  OwnedAttr ao;
   ASSERT_TRUE(xml::deserialize(p, "r", ao));
-  // Without normalization, the raw entity text is preserved.
-  if (ao.x == "a&#x20;&#x20;b") {
-    GTEST_SKIP()
-        << "XFAIL sec 3.3.3: attribute-value normalization not performed";
-  }
   EXPECT_EQ(ao.x, "a  b");
 }
 
 /// sec 4.6 - Predefined entity expansion. A conforming processor MUST
 /// recognize &lt; &gt; &amp; &apos; &quot; and expand them.
-///
-/// XFAIL: TurboXML is zero-copy and does not expand any entities.
 TEST_F(ConformanceGaps, PredefinedEntityExpansion) {
   constexpr std::string_view src = R"(<r><v>&lt;hello&gt;</v></r>)";
-  xml::Parser p{src};
-  Leaf leaf;
+  xml::NormalizingParser p{src};
+  OwnedLeaf leaf;
   ASSERT_TRUE(xml::deserialize(p, "r", leaf));
-  if (leaf.text == "&lt;hello&gt;") {
-    GTEST_SKIP()
-        << "XFAIL sec 4.6: predefined entities not expanded (zero-copy design)";
-  }
   EXPECT_EQ(leaf.text, "<hello>");
 }
 
 /// sec 4.1 - Character reference expansion (&#nnn; / &#xhh;).
-///
-/// XFAIL: TurboXML does not expand character references.
 TEST_F(ConformanceGaps, CharRefExpansion) {
   constexpr std::string_view src = R"(<r><v>&#65;</v></r>)";
-  xml::Parser p{src};
-  Leaf leaf;
+  xml::NormalizingParser p{src};
+  OwnedLeaf leaf;
   ASSERT_TRUE(xml::deserialize(p, "r", leaf));
-  if (leaf.text == "&#65;") {
-    GTEST_SKIP() << "XFAIL sec 4.1: character references not expanded "
-                    "(zero-copy design)";
-  }
   EXPECT_EQ(leaf.text, "A");
 }
