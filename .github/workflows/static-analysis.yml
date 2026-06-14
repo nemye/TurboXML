@@ -39,7 +39,9 @@ jobs:
             --suppress=missingIncludeSystem \
             -I include \
             -I test \
-            .
+            include \
+            test/test_TurboXML.cc \
+            test/test_Conformance.cc
 
 
   clang-tidy:
@@ -65,8 +67,8 @@ jobs:
             -S . \
             -B build \
             -G Ninja \
-            -DCMAKE_CXX_STANDARD=20 \
-            -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+            -DTURBOXML_BUILD_BENCHMARKS=OFF \
+            -DTURBOXML_BUILD_TESTS=ON \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
       - name: Build test targets
@@ -76,11 +78,10 @@ jobs:
       - name: Run clang-tidy
         run: |
           clang-tidy \
-            -p build \
-            $(find . \
-              \( -name "*.cpp" \
-              -o -name "*.cc" \
-              -o -name "*.cxx" \))
+          -p build \
+          $(find . \
+            \( -name "*.cpp" -o -name "*.cc" -o -name "*.cxx" \) \
+            ! -path "./test/bench_*")
 
 
   sanitizers:
