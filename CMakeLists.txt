@@ -10,9 +10,29 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 message(STATUS "TurboXML: Build Type = ${CMAKE_BUILD_TYPE}.")
 
 # ---- Options ----
-option(TURBOXML_BUILD_TESTS      "Build unit tests (requires GTest)"           ON)
-option(TURBOXML_BUILD_BENCHMARKS "Build benchmarks (requires Google Benchmark)" ON)
-option(TURBOXML_WITH_PUGIXML     "Build pugixml comparison benchmarks"          OFF)
+option(TURBOXML_BUILD_TESTS       "Build unit tests (requires GTest)"                      ON)
+option(TURBOXML_BUILD_BENCHMARKS  "Build benchmarks (requires Google Benchmark)"           OFF)
+option(TURBOXML_WITH_PUGIXML      "Build pugixml comparison benchmarks"                    OFF)
+option(TURBOXML_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+
+if(TURBOXML_ENABLE_SANITIZERS)
+    message(STATUS "TurboXML: sanitizers enabled")
+
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        add_compile_options(
+            -fsanitize=address,undefined
+            -fno-omit-frame-pointer
+        )
+
+        add_link_options(
+            -fsanitize=address,undefined
+        )
+    else()
+        message(FATAL_ERROR
+            "Sanitizers are only supported for GCC/Clang"
+        )
+    endif()
+endif()
 
 # ---- Header-only library target ----
 add_library(turboxml INTERFACE)
