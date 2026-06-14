@@ -481,34 +481,82 @@ inline ErrorCode expand_reference(std::string& out, std::string_view s,
   return ErrorCode::None;
 }
 
+/// @brief Bytes that interrupt a bulk copy, indexed by NormMode. A run of
+/// ordinary bytes (table entry false) is copied verbatim with one memcpy; only
+/// the marked bytes need per-character handling: '&' (reference expansion, not
+/// in CData), '\r' (EOL folding, all modes), and literal '\n'/'\t' (folded to a
+/// space, Attr only).
+inline const std::array<bool, 256>& norm_special_table(NormMode mode) noexcept {
+  constexpr auto make = [](bool amp, bool ws) {
+    std::array<bool, 256> t{};
+    t[static_cast<unsigned char>('\r')] = true;
+    if (amp) {
+      t[static_cast<unsigned char>('&')] = true;
+    }
+    if (ws) {
+      t[static_cast<unsigned char>('\n')] = true;
+      t[static_cast<unsigned char>('\t')] = true;
+    }
+    return t;
+  };
+  static constexpr std::array<bool, 256> kText = make(true, false);
+  static constexpr std::array<bool, 256> kAttr = make(true, true);
+  static constexpr std::array<bool, 256> kCData = make(false, false);
+  switch (mode) {
+    case NormMode::Attr:
+      return kAttr;
+    case NormMode::CData:
+      return kCData;
+    case NormMode::Text:
+      break;
+  }
+  return kText;
+}
+
 /// @brief Appends `raw` to `out` under the given NormMode. Returns the first
 /// error encountered (None on success). CData never errors.
+///
+/// Ordinary bytes (the overwhelming majority of typical content) are copied in
+/// bulk runs via std::string::append; only reference starts and line-ending /
+/// whitespace bytes are handled one at a time.
 inline ErrorCode append_normalized(std::string& out, std::string_view raw,
                                    NormMode mode) {
-  out.reserve(out.size() + raw.size());
-  for (size_t i = 0; i < raw.size();) {
-    const char c = raw[i];
-    if (c == '&' && mode != NormMode::CData) {
+  const std::array<bool, 256>& special = norm_special_table(mode);
+  const char* const base = raw.data();
+  const size_t n = raw.size();
+  out.reserve(out.size() + n);
+  size_t i = 0;
+  while (i < n) {
+    // Copy the run of ordinary bytes up to the next byte needing attention.
+    size_t j = i;
+    while (j < n && !special[static_cast<unsigned char>(base[j])]) {
+      ++j;
+    }
+    if (j > i) {
+      out.append(base + i, j - i);
+      i = j;
+      if (i == n) {
+        break;
+      }
+    }
+    const char c = base[i];
+    if (c == '&') {  // marked special only for Text/Attr
       if (const ErrorCode ec = expand_reference(out, raw, i);
           ec != ErrorCode::None) {
         return ec;
       }
-      continue;
+      continue;  // expand_reference advanced i past ';'
     }
     if (c == '\r') {  // EOL normalization: CR and CRLF collapse to one LF.
       out.push_back(mode == NormMode::Attr ? ' ' : '\n');
       ++i;
-      if (i < raw.size() && raw[i] == '\n') {
+      if (i < n && base[i] == '\n') {
         ++i;
       }
       continue;
     }
-    if (mode == NormMode::Attr && (c == '\n' || c == '\t')) {
-      out.push_back(' ');  // literal whitespace -> space (XML 3.3.3 CDATA-type)
-      ++i;
-      continue;
-    }
-    out.push_back(c);
+    // Reached only in Attr mode, for a literal '\n' or '\t'.
+    out.push_back(' ');  // literal whitespace -> space (XML 3.3.3 CDATA-type)
     ++i;
   }
   return ErrorCode::None;

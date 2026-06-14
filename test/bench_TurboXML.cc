@@ -5,9 +5,97 @@
 
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "Helpers.hh"
 #include "TurboXML.hh"
+
+// ---- Benchmark record types ----
+//
+// Record/metadata declarations used by the field-handling benchmarks below
+// (required-vs-optional tracking and string normalization). Each pairs an
+// xml::XmlMetadata specialization with its struct; the per-benchmark comments
+// further down explain how they are compared.
+
+// Optional fields (default): no presence tracking is emitted.
+struct OptItem {
+  int id{};
+  std::string_view title;
+  std::string_view desc;
+  int status{};
+};
+
+template <>
+struct xml::XmlMetadata<OptItem> {
+  static constexpr auto fields = std::make_tuple(
+      xml::attr_field("id", &OptItem::id), xml::field("title", &OptItem::title),
+      xml::field("desc", &OptItem::desc),
+      xml::field("status", &OptItem::status));
+};
+
+struct OptItemList {
+  std::vector<OptItem> items;
+};
+
+template <>
+struct xml::XmlMetadata<OptItemList> {
+  static constexpr auto fields =
+      std::make_tuple(xml::vec_field("Item", &OptItemList::items));
+};
+
+// Required fields: same layout, every field marked required (worst case).
+struct ReqItem {
+  int id{};
+  std::string_view title;
+  std::string_view desc;
+  int status{};
+};
+
+template <>
+struct xml::XmlMetadata<ReqItem> {
+  static constexpr auto fields =
+      std::make_tuple(xml::attr_field("id", &ReqItem::id, true),
+                      xml::field("title", &ReqItem::title, true),
+                      xml::field("desc", &ReqItem::desc, true),
+                      xml::field("status", &ReqItem::status, true));
+};
+
+struct ReqItemList {
+  std::vector<ReqItem> items;
+};
+
+template <>
+struct xml::XmlMetadata<ReqItemList> {
+  static constexpr auto fields =
+      std::make_tuple(xml::vec_field("Item", &ReqItemList::items, true));
+};
+
+// Owning std::string fields: exercises the raw-copy and normalization paths.
+struct NormItem {
+  int id{};
+  std::string title;
+  std::string desc;
+  int status{};
+};
+
+template <>
+struct xml::XmlMetadata<NormItem> {
+  static constexpr auto fields =
+      std::make_tuple(xml::attr_field("id", &NormItem::id),
+                      xml::field("title", &NormItem::title),
+                      xml::field("desc", &NormItem::desc),
+                      xml::field("status", &NormItem::status));
+};
+
+struct NormItemList {
+  std::vector<NormItem> items;
+};
+
+template <>
+struct xml::XmlMetadata<NormItemList> {
+  static constexpr auto fields =
+      std::make_tuple(xml::vec_field("Item", &NormItemList::items));
+};
 
 // Helper functions
 static void build_tree_xml(std::string& xml, int depth, int branching) {
@@ -414,6 +502,86 @@ static void BM_ParseCatalog(benchmark::State& state) {
                           static_cast<int64_t>(kCatalogXml.size()));
 }
 
+// ---- Required vs optional fields ----
+//
+// Two records with identical members and the identical payload (kFlatXml, a
+// 2000-element <FlatList> of <Item id><title><desc><status>); the only
+// difference is whether the fields are declared required. Marking a field
+// required turns on per-element presence tracking (a bitmask OR at each matched
+// field) plus a mask comparison at each closing tag in Parser::pull(); the
+// optional variant compiles all of that away (kHasRequired == false). Parsing
+// the same bytes both ways isolates that tracking overhead. Both records mark
+// every field required (the worst case for the required path).
+
+static void BM_ParseOptionalFields(benchmark::State& state) {
+  for (auto _ : state) {
+    xml::Parser parser{kFlatXml};
+    OptItemList list;
+    bool ok = xml::deserialize(parser, "FlatList", list);
+    benchmark::DoNotOptimize(ok);
+    benchmark::DoNotOptimize(list);
+    benchmark::ClobberMemory();
+  }
+  state.SetBytesProcessed(state.iterations() *
+                          static_cast<int64_t>(kFlatXml.size()));
+}
+
+static void BM_ParseRequiredFields(benchmark::State& state) {
+  for (auto _ : state) {
+    xml::Parser parser{kFlatXml};
+    ReqItemList list;
+    bool ok = xml::deserialize(parser, "FlatList", list);
+    benchmark::DoNotOptimize(ok);
+    benchmark::DoNotOptimize(list);
+    benchmark::ClobberMemory();
+  }
+  state.SetBytesProcessed(state.iterations() *
+                          static_cast<int64_t>(kFlatXml.size()));
+}
+
+// ---- Normalizing string content ----
+//
+// Same kFlatXml payload, but the record holds owning std::string fields and is
+// parsed with xml::NormalizingParser. On that parser, std::string fields route
+// every text run through the normalization scan (reference expansion, CR/CRLF
+// folding, attribute whitespace) instead of a single zero-copy view assignment.
+//
+// Comparison axis vs the two benchmarks above: those use std::string_view (raw,
+// zero-copy), so the delta here bundles two costs — the owning std::string copy
+// AND the per-byte normalization scan. This payload is entity-free, so it
+// measures the steady-state cost of the normalization machinery on plain
+// content; documents carrying many &entities;/&#refs; would add expansion work
+// on top. BM_ParseOwnedRawStrings isolates the owning-copy half so the
+// normalization half can be read off as the difference.
+
+// Owning std::string fields parsed with the default (non-normalizing) parser:
+// the copy cost without the normalization scan, as a baseline for the delta.
+static void BM_ParseOwnedRawStrings(benchmark::State& state) {
+  for (auto _ : state) {
+    xml::Parser parser{kFlatXml};
+    NormItemList list;
+    bool ok = xml::deserialize(parser, "FlatList", list);
+    benchmark::DoNotOptimize(ok);
+    benchmark::DoNotOptimize(list);
+    benchmark::ClobberMemory();
+  }
+  state.SetBytesProcessed(state.iterations() *
+                          static_cast<int64_t>(kFlatXml.size()));
+}
+
+static void BM_ParseNormalizedFields(benchmark::State& state) {
+  for (auto _ : state) {
+    xml::NormalizingParser parser{kFlatXml};
+    NormItemList list;
+    bool ok = xml::deserialize(parser, "FlatList", list);
+    benchmark::DoNotOptimize(ok);
+    benchmark::DoNotOptimize(list);
+    benchmark::ClobberMemory();
+  }
+  state.SetBytesProcessed(state.iterations() *
+                          static_cast<int64_t>(kFlatXml.size()));
+}
+
 BENCHMARK(BM_ParseFlatXml);
 BENCHMARK(BM_ParseDeepXml);
 BENCHMARK(BM_ParseAttrXml);
@@ -424,6 +592,10 @@ BENCHMARK(BM_ParseTreeXml);
 BENCHMARK(BM_ParseCommentHeavyXml);
 BENCHMARK(BM_ParseUnknownHeavyXml);
 BENCHMARK(BM_ParseCatalog);
+BENCHMARK(BM_ParseOptionalFields);
+BENCHMARK(BM_ParseRequiredFields);
+BENCHMARK(BM_ParseOwnedRawStrings);
+BENCHMARK(BM_ParseNormalizedFields);
 
 #ifdef TURBOXML_HAS_PUGIXML
 #include <pugixml.hpp>

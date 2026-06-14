@@ -1739,10 +1739,10 @@ struct ReqRecord {
 
 template <>
 struct xml::XmlMetadata<ReqRecord> {
-  static constexpr auto fields = std::make_tuple(
-      xml::attr_field("id", &ReqRecord::id, /*required=*/true),
-      xml::field("name", &ReqRecord::name, /*required=*/true),
-      xml::field("note", &ReqRecord::note));
+  static constexpr auto fields =
+      std::make_tuple(xml::attr_field("id", &ReqRecord::id, true),
+                      xml::field("name", &ReqRecord::name, true),
+                      xml::field("note", &ReqRecord::note));
 };
 
 struct ReqList {
@@ -1751,8 +1751,8 @@ struct ReqList {
 
 template <>
 struct xml::XmlMetadata<ReqList> {
-  static constexpr auto fields = std::make_tuple(
-      xml::vec_field("item", &ReqList::items, /*required=*/true));
+  static constexpr auto fields =
+      std::make_tuple(xml::vec_field("item", &ReqList::items, true));
 };
 
 struct ReqParent {
@@ -1761,8 +1761,8 @@ struct ReqParent {
 
 template <>
 struct xml::XmlMetadata<ReqParent> {
-  static constexpr auto fields = std::make_tuple(
-      xml::field("ReqRecord", &ReqParent::child, /*required=*/true));
+  static constexpr auto fields =
+      std::make_tuple(xml::field("ReqRecord", &ReqParent::child, true));
 };
 
 /// @brief All required fields present, optional one absent -> success.
@@ -1975,7 +1975,8 @@ TEST_F(TurboBasicTests, NormalizeCharacterReferences) {
   xml::NormalizingParser p{src};
   NormText t;
   ASSERT_TRUE(xml::deserialize(p, "NormText", t));
-  EXPECT_EQ(t.v, std::string("AB") + "\xE2\x9D\xA4");  // U+2764 HEAVY BLACK HEART
+  EXPECT_EQ(t.v,
+            std::string("AB") + "\xE2\x9D\xA4");  // U+2764 HEAVY BLACK HEART
 }
 
 /// @brief CDATA content is copied literally: references inside it are NOT
