@@ -32,10 +32,7 @@
 
 #include "TurboXML.hh"
 
-// ---------------------------------------------------------------------------
-// Local type scaffolding — minimal structs for exercising the parser without
-// pulling in the full Helpers.hh hierarchy.
-// ---------------------------------------------------------------------------
+// Helper structs for exercising the parser.
 
 struct Leaf {
   std::string_view text;
@@ -120,7 +117,7 @@ struct xml::XmlMetadata<OwnedLeaf> {
       std::make_tuple(xml::field("v", &OwnedLeaf::text));
 };
 
-// sec 2.1 — Well-Formed XML Documents [Production 1: document]
+// sec 2.1 - Well-Formed XML Documents [Production 1: document]
 class Sec2_1_WellFormedDocument : public ::testing::Test {};
 
 /// Production [1]: document ::= prolog element Misc*
@@ -144,7 +141,7 @@ TEST_F(Sec2_1_WellFormedDocument, ExtraContentAfterRootIgnored) {
   EXPECT_EQ(leaf.text, "ok");
 }
 
-/// No root element at all — must fail.
+/// No root element at all - must fail.
 TEST_F(Sec2_1_WellFormedDocument, NoRootElement) {
   constexpr std::string_view src = R"(<!-- just a comment -->)";
   xml::Parser p{src};
@@ -153,7 +150,7 @@ TEST_F(Sec2_1_WellFormedDocument, NoRootElement) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::RootElementNotFound);
 }
 
-/// Empty input — must fail.
+/// Empty input - must fail.
 TEST_F(Sec2_1_WellFormedDocument, EmptyInput) {
   xml::Parser p{""};
   Leaf leaf;
@@ -161,7 +158,7 @@ TEST_F(Sec2_1_WellFormedDocument, EmptyInput) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::RootElementNotFound);
 }
 
-/// Whitespace-only input — must fail (no element).
+/// Whitespace-only input - must fail (no element).
 TEST_F(Sec2_1_WellFormedDocument, WhitespaceOnlyInput) {
   constexpr std::string_view src = "   \n\t  \n  ";
   xml::Parser p{src};
@@ -170,7 +167,7 @@ TEST_F(Sec2_1_WellFormedDocument, WhitespaceOnlyInput) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::RootElementNotFound);
 }
 
-// sec 2.2 — Characters [Production 2: Char]
+// sec 2.2 - Characters [Production 2: Char]
 class Sec2_2_Characters : public ::testing::Test {};
 
 /// Tab (#x9), LF (#xA), CR (#xD), and space (#x20) are legal in content.
@@ -216,7 +213,7 @@ TEST_F(Sec2_2_Characters, Utf8CjkContent) {
   EXPECT_EQ(leaf.text, "漢字");
 }
 
-// sec 2.3 — Common Syntactic Constructs [Productions 3-8: S, Name, etc.]
+// sec 2.3 - Common Syntactic Constructs [Productions 3-8: S, Name, etc.]
 class Sec2_3_Names : public ::testing::Test {};
 
 /// Names may contain hyphens, dots, digits, underscores, colons.
@@ -282,7 +279,7 @@ TEST_F(Sec2_3_Names, NameStartingWithDotFails) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::UnexpectedCharAfterLt);
 }
 
-// sec 2.4 — Character Data and Markup [Production 14: CharData]
+// sec 2.4 - Character Data and Markup [Production 14: CharData]
 class Sec2_4_CharData : public ::testing::Test {};
 
 /// Production [14]: CharData must not contain "]]>" (the CDATA close
@@ -306,7 +303,7 @@ TEST_F(Sec2_4_CharData, CDataEndDelimiterInTextShouldFail) {
   }
 }
 
-// sec 2.5 — Comments [Production 15]
+// sec 2.5 - Comments [Production 15]
 class Sec2_5_Comments : public ::testing::Test {};
 
 /// Well-formed comment between elements should be skipped.
@@ -380,7 +377,7 @@ TEST_F(Sec2_5_Comments, CommentEndingWithTripleHyphenShouldFail) {
   }
 }
 
-/// Unterminated comment — must fail.
+/// Unterminated comment - must fail.
 TEST_F(Sec2_5_Comments, UnterminatedComment) {
   constexpr std::string_view src = R"(<!-- never ends <r><v>ok</v></r>)";
   xml::Parser p{src};
@@ -389,7 +386,7 @@ TEST_F(Sec2_5_Comments, UnterminatedComment) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::UnterminatedComment);
 }
 
-// sec 2.6 — Processing Instructions [Production 16-17]
+// sec 2.6 - Processing Instructions [Production 16-17]
 class Sec2_6_PI : public ::testing::Test {};
 
 /// A well-formed PI before the root is skipped.
@@ -417,10 +414,10 @@ TEST_F(Sec2_6_PI, PIBetweenElements) {
 /// NOTE: TurboXML treats "<?xml ...?>" as TokenType::XmlDeclaration and
 /// any other PI target as TokenType::ProcessingInstruction. The parser
 /// doesn't specifically reject "<?XML ...?>" or "<?Xml ...?>" as
-/// illegal PI targets — it only checks exact lowercase "xml". This is
+/// illegal PI targets - it only checks exact lowercase "xml". This is
 /// a conformance gap for mixed-case variants.
 TEST_F(Sec2_6_PI, PITargetXmlLowercase) {
-  // "<?xml ...?>" at the start is the XML declaration — legal.
+  // "<?xml ...?>" at the start is the XML declaration - legal.
   constexpr std::string_view src = R"(<?xml version="1.0"?><r><v>ok</v></r>)";
   xml::Parser p{src};
   Leaf leaf;
@@ -457,7 +454,7 @@ TEST_F(Sec2_6_PI, PITargetXmlPrefixedNameAllowed) {
   EXPECT_EQ(leaf.text, "ok");
 }
 
-/// Unterminated PI — must fail.
+/// Unterminated PI - must fail.
 TEST_F(Sec2_6_PI, UnterminatedPI) {
   constexpr std::string_view src = R"(<?proc never ends <r><v>ok</v></r>)";
   xml::Parser p{src};
@@ -466,7 +463,7 @@ TEST_F(Sec2_6_PI, UnterminatedPI) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::UnterminatedPi);
 }
 
-// sec 2.7 — CDATA Sections [Production 18-21]
+// sec 2.7 - CDATA Sections [Production 18-21]
 class Sec2_7_CDATA : public ::testing::Test {};
 
 /// Well-formed CDATA between elements is skipped during struct
@@ -494,7 +491,7 @@ TEST_F(Sec2_7_CDATA, NestedCData) {
   std::ignore = xml::deserialize(p, "r", leaf);
 }
 
-/// Unterminated CDATA — must fail.
+/// Unterminated CDATA - must fail.
 TEST_F(Sec2_7_CDATA, UnterminatedCData) {
   constexpr std::string_view src = R"(<r><![CDATA[never ends</r>)";
   xml::Parser p{src};
@@ -503,7 +500,7 @@ TEST_F(Sec2_7_CDATA, UnterminatedCData) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::UnterminatedCData);
 }
 
-// sec 2.8 — Prolog and Document Type Declaration [Production 22-28]
+// sec 2.8 - Prolog and Document Type Declaration [Production 22-28]
 class Sec2_8_Prolog : public ::testing::Test {};
 
 /// XML declaration must come before the root element.
@@ -556,7 +553,7 @@ TEST_F(Sec2_8_Prolog, DoctypeWithInternalSubset) {
   EXPECT_EQ(leaf.text, "ok");
 }
 
-// sec 2.10 — White Space Handling
+// sec 2.10 - White Space Handling
 class Sec2_10_Whitespace : public ::testing::Test {};
 
 /// Leading and trailing whitespace in element content is preserved
@@ -581,7 +578,7 @@ TEST_F(Sec2_10_Whitespace, WhitespaceBetweenElements) {
   EXPECT_EQ(tf.b, "y");
 }
 
-// sec 2.11 — End-of-Line Handling
+// sec 2.11 - End-of-Line Handling
 class Sec2_11_EOL : public ::testing::Test {};
 
 /// Per spec, \r\n → \n and bare \r → \n before any other processing.
@@ -614,12 +611,12 @@ TEST_F(Sec2_11_EOL, BareCarriageReturn) {
   EXPECT_EQ(leaf.text, "a\nb");
 }
 
-// sec 3.1 — Start-Tags, End-Tags, and Empty-Element Tags
+// sec 3.1 - Start-Tags, End-Tags, and Empty-Element Tags
 //         [Productions 40-44, WFC: Element Type Match,
 //          WFC: Unique Att Spec, WFC: No < in Attribute Values]
 class Sec3_1_Tags : public ::testing::Test {};
 
-/// WFC: Element Type Match — the end-tag name must match the start-tag.
+/// WFC: Element Type Match - the end-tag name must match the start-tag.
 TEST_F(Sec3_1_Tags, WFC_ElementTypeMatch_Mismatch) {
   constexpr std::string_view src = R"(<r><v>data</wrong></r>)";
   xml::Parser p{src};
@@ -628,7 +625,7 @@ TEST_F(Sec3_1_Tags, WFC_ElementTypeMatch_Mismatch) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::ElementMismatch);
 }
 
-/// WFC: Element Type Match — case-sensitive matching.
+/// WFC: Element Type Match - case-sensitive matching.
 TEST_F(Sec3_1_Tags, WFC_ElementTypeMatch_CaseSensitive) {
   constexpr std::string_view src = R"(<R><v>data</v></R>)";
   xml::Parser p{src};
@@ -722,7 +719,7 @@ TEST_F(Sec3_1_Tags, QuoteCharInsideOppositeDelimiter) {
   EXPECT_EQ(ao.y, "it's");
 }
 
-/// Unquoted attribute value — must fail.
+/// Unquoted attribute value - must fail.
 TEST_F(Sec3_1_Tags, UnquotedAttributeFails) {
   constexpr std::string_view src = R"(<r x=hello/>)";
   xml::Parser p{src};
@@ -749,7 +746,7 @@ TEST_F(Sec3_1_Tags, WFC_NoLtInAttributeValue) {
   }
 }
 
-/// WFC: Unique Att Spec — no two attributes in a start-tag may share
+/// WFC: Unique Att Spec - no two attributes in a start-tag may share
 /// the same name.
 ///
 /// XFAIL: TurboXML does not check for duplicate attributes. The last
@@ -770,7 +767,7 @@ TEST_F(Sec3_1_Tags, WFC_UniqueAttSpec) {
   }
 }
 
-/// Unclosed start tag — must fail.
+/// Unclosed start tag - must fail.
 TEST_F(Sec3_1_Tags, UnclosedStartTag) {
   constexpr std::string_view src = R"(<r x="v")";
   xml::Parser p{src};
@@ -779,7 +776,7 @@ TEST_F(Sec3_1_Tags, UnclosedStartTag) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::UnclosedTag);
 }
 
-/// End-tag with no name — must fail.
+/// End-tag with no name - must fail.
 TEST_F(Sec3_1_Tags, EndTagNoName) {
   constexpr std::string_view src = R"(<r></>)";
   xml::Parser p{src};
@@ -788,7 +785,7 @@ TEST_F(Sec3_1_Tags, EndTagNoName) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::ExpectedNameInCloseTag);
 }
 
-/// Proper nesting is required — overlapping elements are ill-formed.
+/// Proper nesting is required - overlapping elements are ill-formed.
 TEST_F(Sec3_1_Tags, OverlappingElements) {
   constexpr std::string_view src = R"(<r><a>text</r></a>)";
   xml::Parser p{src};
@@ -797,7 +794,7 @@ TEST_F(Sec3_1_Tags, OverlappingElements) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::ElementMismatch);
 }
 
-// sec 3.1 — Namespace-prefixed elements
+// sec 3.1 - Namespace-prefixed elements
 class Sec3_1_Namespaces : public ::testing::Test {};
 
 /// Elements with namespace prefixes should parse; the local name is
@@ -812,7 +809,7 @@ TEST_F(Sec3_1_Namespaces, PrefixedElementName) {
   EXPECT_EQ(leaf.text, "ok");
 }
 
-/// Prefixed child elements — local name used for field matching.
+/// Prefixed child elements - local name used for field matching.
 TEST_F(Sec3_1_Namespaces, PrefixedChildElement) {
   constexpr std::string_view src = R"(<r><ns:v>ok</ns:v></r>)";
   xml::Parser p{src};
@@ -821,7 +818,7 @@ TEST_F(Sec3_1_Namespaces, PrefixedChildElement) {
   EXPECT_EQ(leaf.text, "ok");
 }
 
-/// Prefixed attributes — local name used for hash matching.
+/// Prefixed attributes - local name used for hash matching.
 TEST_F(Sec3_1_Namespaces, PrefixedAttribute) {
   constexpr std::string_view src = R"(<r ns:x="hello" y="world"/>)";
   xml::Parser p{src};
@@ -831,10 +828,10 @@ TEST_F(Sec3_1_Namespaces, PrefixedAttribute) {
   EXPECT_EQ(ao.y, "world");
 }
 
-// sec 4.1 — Character and Entity References [Production 66-68]
+// sec 4.1 - Character and Entity References [Production 66-68]
 class Sec4_1_References : public ::testing::Test {};
 
-/// sec 4.6 — Predefined entities: &amp; &lt; &gt; &apos; &quot;
+/// sec 4.6 - Predefined entities: &amp; &lt; &gt; &apos; &quot;
 /// TurboXML does NOT expand entities (zero-copy). The raw text
 /// including the ampersand and semicolon is preserved.
 TEST_F(Sec4_1_References, PredefinedEntitiesPreservedRaw) {
@@ -854,11 +851,11 @@ TEST_F(Sec4_1_References, NumericCharRefPreservedRaw) {
   xml::Parser p{src};
   Leaf leaf;
   ASSERT_TRUE(xml::deserialize(p, "r", leaf));
-  // Raw text — not expanded to "AB".
+  // Raw text - not expanded to "AB".
   EXPECT_EQ(leaf.text, "&#65;&#x42;");
 }
 
-/// Entity references in attribute values — also preserved raw.
+/// Entity references in attribute values - also preserved raw.
 TEST_F(Sec4_1_References, EntityRefInAttributeRaw) {
   constexpr std::string_view src = R"(<r x="a&amp;b" y="c&lt;d"/>)";
   xml::Parser p{src};
@@ -877,14 +874,14 @@ TEST_F(Sec4_1_References, OwnedStringPreservesEntities) {
   EXPECT_EQ(leaf.text, "hello &amp; world");
 }
 
-// sec 5 — Conformance / sec 5.1 — Processor Classification
+// sec 5 - Conformance / sec 5.1 - Processor Classification
 class Sec5_Conformance : public ::testing::Test {};
 
 /// A non-validating processor MUST report violations of well-formedness
 /// constraints as fatal errors (returning false / error token).
 /// This test aggregates the minimal set of fatal-error scenarios.
 
-/// Missing end tag for root — must fail.
+/// Missing end tag for root - must fail.
 TEST_F(Sec5_Conformance, FatalError_MissingEndTag) {
   constexpr std::string_view src = R"(<r><v>ok</v>)";
   xml::Parser p{src};
@@ -897,7 +894,7 @@ TEST_F(Sec5_Conformance, FatalError_MissingEndTag) {
 /// of markup. In practice TurboXML's next_from_source treats '<' as
 /// the start of markup and will attempt to parse what follows.
 TEST_F(Sec5_Conformance, FatalError_BareLtInContent) {
-  // "< " is not valid markup start — is_name_start(' ') is false.
+  // "< " is not valid markup start - is_name_start(' ') is false.
   constexpr std::string_view src = R"(<r><v>a < b</v></r>)";
   xml::Parser p{src};
   Leaf leaf;
@@ -923,7 +920,7 @@ TEST_F(Sec5_Conformance, BareAmpersandPassedThrough) {
 // Additional well-formedness edge cases
 class WellFormedness : public ::testing::Test {};
 
-/// Multiple root elements — only the first should be deserialized.
+/// Multiple root elements - only the first should be deserialized.
 TEST_F(WellFormedness, TwoRootElements) {
   constexpr std::string_view src = R"(<r><v>first</v></r><r><v>second</v></r>)";
   xml::Parser p{src};
@@ -953,7 +950,7 @@ TEST_F(WellFormedness, DeepNesting) {
   std::ignore = xml::deserialize(p, "r", leaf);
 }
 
-/// Interleaved CDATA, comments, PIs — all should be skipped cleanly.
+/// Interleaved CDATA, comments, PIs - all should be skipped cleanly.
 TEST_F(WellFormedness, InterleavedMisc) {
   constexpr std::string_view src = R"(
 <?xml version="1.0"?>
@@ -989,7 +986,7 @@ TEST_F(WellFormedness, ResetAndReparse) {
   EXPECT_EQ(second.text, "hello");
 }
 
-/// Vector field with zero children — empty vector, no error.
+/// Vector field with zero children - empty vector, no error.
 TEST_F(WellFormedness, EmptyVectorField) {
   constexpr std::string_view src = R"(<r></r>)";
   xml::Parser p{src};
@@ -1030,7 +1027,7 @@ TEST_F(WellFormedness, NegativeInteger) {
   EXPECT_EQ(li.value, -7);
 }
 
-/// Large document — many siblings.
+/// Large document - many siblings.
 TEST_F(WellFormedness, ManySiblings) {
   std::string src = "<r>";
   for (int i = 0; i < 10000; ++i) {
@@ -1054,7 +1051,7 @@ TEST_F(WellFormedness, NestedStruct) {
   EXPECT_EQ(n.inner.text, "deep");
 }
 
-/// Self-closing root with no fields to read — should succeed.
+/// Self-closing root with no fields to read - should succeed.
 TEST_F(WellFormedness, SelfClosingRoot) {
   constexpr std::string_view src = R"(<r/>)";
   xml::Parser p{src};
@@ -1096,7 +1093,7 @@ TEST_F(AttributeEdges, NumericAttrAsString) {
   EXPECT_EQ(ao.y, "0");
 }
 
-/// Attributes appear after unknown attributes — registered ones are
+/// Attributes appear after unknown attributes - registered ones are
 /// still found via hash lookup.
 TEST_F(AttributeEdges, UnknownAttributesSkipped) {
   constexpr std::string_view src =
@@ -1138,7 +1135,7 @@ TEST_F(Robustness, TruncatedInAttrValue) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::UnterminatedAttributeValue);
 }
 
-/// Just a '<' — must not crash.
+/// Just a '<' - must not crash.
 TEST_F(Robustness, JustLessThan) {
   constexpr std::string_view src = "<";
   xml::Parser p{src};
@@ -1147,7 +1144,7 @@ TEST_F(Robustness, JustLessThan) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::UnexpectedEndAfterLt);
 }
 
-/// Just "</" — must not crash.
+/// Just "</" - must not crash.
 TEST_F(Robustness, JustCloseTagStart) {
   constexpr std::string_view src = "</";
   xml::Parser p{src};
@@ -1156,7 +1153,7 @@ TEST_F(Robustness, JustCloseTagStart) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::ExpectedNameInCloseTag);
 }
 
-/// Just "<!-" — partial comment start, must not crash.
+/// Just "<!-" - partial comment start, must not crash.
 TEST_F(Robustness, PartialCommentStart) {
   constexpr std::string_view src = "<!-";
   xml::Parser p{src};
@@ -1165,7 +1162,7 @@ TEST_F(Robustness, PartialCommentStart) {
   EXPECT_EQ(p.error_code(), xml::ErrorCode::RootElementNotFound);
 }
 
-/// Just "<?" — partial PI, must not crash.
+/// Just "<?" - partial PI, must not crash.
 TEST_F(Robustness, PartialPIStart) {
   constexpr std::string_view src = "<?";
   xml::Parser p{src};
@@ -1204,7 +1201,7 @@ TEST_F(Robustness, VeryLongTextContent) {
   EXPECT_EQ(leaf.text.size(), val.size());
 }
 
-/// Random garbage after valid XML — doesn't affect the first parse.
+/// Random garbage after valid XML - doesn't affect the first parse.
 TEST_F(Robustness, GarbageAfterDocument) {
   constexpr std::string_view src = R"(<r><v>ok</v></r>@#$%^&*garbage)";
   xml::Parser p{src};
@@ -1213,12 +1210,12 @@ TEST_F(Robustness, GarbageAfterDocument) {
   EXPECT_EQ(leaf.text, "ok");
 }
 
-// Conformance gap summary tests — these exercise areas where the
+// Conformance gap summary tests - these exercise areas where the
 // parser diverges from full XML 1.0 conformance. Each is marked
 // XFAIL when the parser is known to accept what should be rejected.
 class ConformanceGaps : public ::testing::Test {};
 
-/// sec 3.3.3 — Attribute-value normalization. For CDATA-typed attributes
+/// sec 3.3.3 - Attribute-value normalization. For CDATA-typed attributes
 /// (the default without a DTD), processors should replace character
 /// references and entity references, then normalize whitespace.
 ///
@@ -1236,7 +1233,7 @@ TEST_F(ConformanceGaps, AttrValueNormalization) {
   EXPECT_EQ(ao.x, "a  b");
 }
 
-/// sec 4.6 — Predefined entity expansion. A conforming processor MUST
+/// sec 4.6 - Predefined entity expansion. A conforming processor MUST
 /// recognize &lt; &gt; &amp; &apos; &quot; and expand them.
 ///
 /// XFAIL: TurboXML is zero-copy and does not expand any entities.
@@ -1252,7 +1249,7 @@ TEST_F(ConformanceGaps, PredefinedEntityExpansion) {
   EXPECT_EQ(leaf.text, "<hello>");
 }
 
-/// sec 4.1 — Character reference expansion (&#nnn; / &#xhh;).
+/// sec 4.1 - Character reference expansion (&#nnn; / &#xhh;).
 ///
 /// XFAIL: TurboXML does not expand character references.
 TEST_F(ConformanceGaps, CharRefExpansion) {

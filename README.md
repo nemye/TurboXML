@@ -18,11 +18,11 @@ Benchmarked against [pugixml](https://pugixml.org/) on identical workloads. Both
 
 ## Features
 
-- **Header-only** — single file, drop `TurboXML.hh` into your project
-- **Flexibility** — `std::string_view` fields point directly into the source buffer or `std::string` fields materialize copies that outlive the source
-- **Compile-time dispatch** — field lookup via FNV-1a hash + constexpr dispatch tables
-- **Serializer** — round-trip to well-formed XML with compile-time pretty/compact control
-- **Extensible containers** — specialize `XmlContainerTraits` to read into any container type
+- **Header-only** - single file, drop `TurboXML.hh` into your project
+- **Flexibility** - `std::string_view` fields point directly into the source buffer or `std::string` fields materialize copies that outlive the source
+- **Compile-time dispatch** - field lookup via FNV-1a hash + constexpr dispatch tables
+- **Serializer** - round-trip to well-formed XML with compile-time pretty/compact control
+- **Extensible containers** - specialize `XmlContainerTraits` to read into any container type
 
 ## Quick Start
 
