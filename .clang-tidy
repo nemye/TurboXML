@@ -1,0 +1,22 @@
+Checks:
+  - bugprone-*
+  - clang-analyzer-*
+  - performance-*
+  - portability-*
+  - modernize-*
+
+WarningsAsErrors:
+  - bugprone-*
+  - clang-analyzer-*
+
+HeaderFilterRegex: '.*'
+
+FormatStyle: file
+
+CheckOptions:
+
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
