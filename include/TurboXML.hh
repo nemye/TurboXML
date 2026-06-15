@@ -396,8 +396,8 @@ constexpr bool all_unique(const std::array<FieldHash, N>& arr) noexcept {
 /// std::string field. Reference expansion and line-ending normalization only
 /// run on this path; std::string_view fields stay raw and zero-copy.
 enum class NormMode : uint8_t {
-  Text,   ///< Element text: expand references, normalize CR/CRLF -> LF.
-  Attr,   ///< Attribute value: as Text, plus literal whitespace -> single space.
+  Text,  ///< Element text: expand references, normalize CR/CRLF -> LF.
+  Attr,  ///< Attribute value: as Text, plus literal whitespace -> single space.
   CData,  ///< CDATA content: normalize line endings only; '&' stays literal.
 };
 
@@ -405,10 +405,9 @@ enum class NormMode : uint8_t {
 /// cp is not a valid XML character (out of range, a surrogate, or a forbidden
 /// control character), per the Char production [2].
 inline bool encode_utf8(std::string& out, uint32_t cp) {
-  const bool valid = cp == 0x9 || cp == 0xA || cp == 0xD ||
-                     (cp >= 0x20 && cp <= 0xD7FF) ||
-                     (cp >= 0xE000 && cp <= 0xFFFD) ||
-                     (cp >= 0x10000 && cp <= 0x10FFFF);
+  const bool valid =
+      cp == 0x9 || cp == 0xA || cp == 0xD || (cp >= 0x20 && cp <= 0xD7FF) ||
+      (cp >= 0xE000 && cp <= 0xFFFD) || (cp >= 0x10000 && cp <= 0x10FFFF);
   if (!valid) {
     return false;
   }
@@ -787,6 +786,15 @@ class BasicParser {
   auto next_from_source(Token& token) -> bool;
   void skip_element();
 
+  // First occurrence of `c` in [from, end_), or end_ if absent — std::find
+  // semantics over the parse range.
+  [[nodiscard]] auto find_byte(const char* from, char c) const noexcept -> const
+      char* {
+    const char* hit = static_cast<const char*>(
+        std::memchr(from, c, static_cast<size_t>(end_ - from)));
+    return hit != nullptr ? hit : end_;
+  }
+
   // Scan forward until `delim` is found. Sets token.data to the content
   // before the delimiter and advances past it.
   auto scan_to_delimiter(Token& token, std::string_view delim, ErrorCode ec)
@@ -794,13 +802,10 @@ class BasicParser {
     const char* start = cur_;
     const char first = delim[0];
     while (cur_ < end_) {
-      const char* hit = static_cast<const char*>(
-          std::memchr(cur_, first, static_cast<size_t>(end_ - cur_)));
-      if (!hit) {
-        cur_ = end_;
+      cur_ = find_byte(cur_, first);
+      if (cur_ == end_) {
         break;
       }
-      cur_ = hit;
       if (starts_with(delim)) {
         token.data = {start, static_cast<size_t>(cur_ - start)};
         cur_ += delim.size();
@@ -815,12 +820,10 @@ class BasicParser {
   void skip_past(std::string_view delim) noexcept {
     const char first = delim[0];
     while (cur_ < end_) {
-      const char* hit = static_cast<const char*>(
-          std::memchr(cur_, first, static_cast<size_t>(end_ - cur_)));
-      if (!hit) {
+      cur_ = find_byte(cur_, first);
+      if (cur_ == end_) {
         break;
       }
-      cur_ = hit;
       if (starts_with(delim)) {
         cur_ += delim.size();
         return;
@@ -833,15 +836,14 @@ class BasicParser {
   // Comment ::= '<!--' ((Char - '-') | ('-' (Char - '-')))* '-->'
   // The well-formedness rule forbids "--" anywhere in the content, so the first
   // "--" we encounter must be the start of the "-->" terminator; any other "--"
-  // is a fatal error. This is a single memchr-driven pass (no slower than the
-  // generic scan it replaces) that additionally enforces the WFC.
+  // is a fatal error. This is a single std::find-driven pass (no slower than
+  // the generic scan it replaces) that additionally enforces the WFC.
   auto parse_comment(Token& token) -> bool {
     token.type = TokenType::Comment;
     const char* start = cur_;
     while (cur_ < end_) {
-      const char* hit = static_cast<const char*>(
-          std::memchr(cur_, '-', static_cast<size_t>(end_ - cur_)));
-      if (!hit || hit + 1 >= end_) {
+      const char* hit = find_byte(cur_, '-');
+      if (hit == end_ || hit + 1 >= end_) {
         break;  // no '-' (or a lone trailing '-'): unterminated
       }
       if (hit[1] != '-') {
@@ -1088,9 +1090,7 @@ inline auto BasicParser<Normalize>::next_from_source(Token& token) -> bool {
     return parse_markup(token);
   }
   const char* start = cur_;
-  const char* next_tag = static_cast<const char*>(
-      std::memchr(cur_, '<', static_cast<size_t>(end_ - cur_)));
-  cur_ = next_tag ? next_tag : end_;
+  cur_ = find_byte(cur_, '<');
   token.type = TokenType::Text;
   token.data = {start, static_cast<size_t>(cur_ - start)};
   return true;
@@ -1116,9 +1116,8 @@ inline auto BasicParser<Normalize>::parse_markup(Token& token) -> bool {
       cur_ += 7;
       return parse_cdata(token);
     }
-    const char* found = static_cast<const char*>(
-        std::memchr(cur_, '>', static_cast<size_t>(end_ - cur_)));
-    cur_ = found ? found + 1 : end_;
+    const char* gt = find_byte(cur_, '>');
+    cur_ = gt == end_ ? end_ : gt + 1;
     return next_from_source(token);
   }
   if (c == '?') {
@@ -1176,9 +1175,8 @@ inline auto BasicParser<Normalize>::parse_element_open(Token& token) -> bool {
     }
     ++cur_;
     const char* val_start = cur_;
-    const char* val_end = static_cast<const char*>(
-        std::memchr(cur_, quote, static_cast<size_t>(end_ - cur_)));
-    if (!val_end) {
+    const char* val_end = find_byte(cur_, quote);
+    if (val_end == end_) {
       return make_error(token, ErrorCode::UnterminatedAttributeValue);
     }
     a.value = {val_start, static_cast<size_t>(val_end - val_start)};
@@ -1258,8 +1256,9 @@ inline auto BasicParser<Normalize>::value(std::string_view expected_name,
           out = token->data;
         }
         if (token->type == TokenType::ElementClose) {
-          return token->name == expected_name ? true
-                                              : fail(ErrorCode::ElementMismatch);
+          return token->name == expected_name
+                     ? true
+                     : fail(ErrorCode::ElementMismatch);
         }
       }
       return fail(ErrorCode::UnexpectedEof);  // next() set a code, or true EOF
@@ -1314,8 +1313,8 @@ inline auto BasicParser<Normalize>::attr(const FieldHash hash, T& out,
 }
 
 template <bool Normalize>
-inline auto BasicParser<Normalize>::begin_element(std::string_view expected_name)
-    -> bool {
+inline auto BasicParser<Normalize>::begin_element(
+    std::string_view expected_name) -> bool {
   while (const Token* peeked = peek()) {
     if (peeked->type == TokenType::ElementOpen) {
       if (peeked->name == expected_name) {
@@ -1386,18 +1385,16 @@ inline void BasicParser<Normalize>::skip_element() {
   }
   size_t depth = 1;
   while (depth > 0) {
-    const char* lt = static_cast<const char*>(
-        std::memchr(cur_, '<', static_cast<size_t>(end_ - cur_)));
-    if (!lt || lt + 1 >= end_) {
+    const char* lt = find_byte(cur_, '<');
+    if (lt == end_ || lt + 1 >= end_) {
       cur_ = end_;
       return;
     }
     cur_ = lt + 1;
     const char c = *cur_;
     if (c == '/') {
-      const char* gt = static_cast<const char*>(
-          std::memchr(cur_, '>', static_cast<size_t>(end_ - cur_)));
-      if (!gt) {
+      const char* gt = find_byte(cur_, '>');
+      if (gt == end_) {
         cur_ = end_;
         return;
       }
@@ -1430,9 +1427,8 @@ inline void BasicParser<Normalize>::skip_element() {
           break;
         }
         if (ch == '"' || ch == '\'') {
-          const char* q = static_cast<const char*>(
-              std::memchr(cur_ + 1, ch, static_cast<size_t>(end_ - cur_ - 1)));
-          if (!q) {
+          const char* q = find_byte(cur_ + 1, ch);
+          if (q == end_) {
             cur_ = end_;
             return;
           }
@@ -1476,10 +1472,10 @@ inline auto BasicParser<Normalize>::read_element(std::string_view expected_name,
       }
       return fail(ErrorCode::InvalidNumericValue);  // empty numeric/bool
     }
-    // Fast path: locate closing tag directly via memchr.
-    const char* found = static_cast<const char*>(
-        std::memchr(cur_, '<', static_cast<size_t>(end_ - cur_)));
-    if (found && found + 3 + expected_name.size() <= end_ && found[1] == '/' &&
+    // Fast path: locate closing tag directly.
+    const char* found = find_byte(cur_, '<');
+    if (found != end_ && found + 3 + expected_name.size() <= end_ &&
+        found[1] == '/' &&
         std::memcmp(found + 2, expected_name.data(), expected_name.size()) ==
             0 &&
         found[2 + expected_name.size()] == '>') {
@@ -1591,9 +1587,7 @@ inline auto BasicParser<Normalize>::pull(T& object, const uint16_t depth)
         }
       }
 
-      const char* found = static_cast<const char*>(
-          std::memchr(cur_, '<', static_cast<size_t>(end_ - cur_)));
-      cur_ = found ? found : end_;
+      cur_ = find_byte(cur_, '<');
     }
 
     const Token* token = peek();
