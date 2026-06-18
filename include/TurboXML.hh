@@ -247,8 +247,8 @@ using EnumEntry = std::pair<std::string_view, E>;
 
 /// @brief Adapts a C++ enum to/from its XML token spelling. Specialize with a
 /// `values` member: a constexpr range of EnumEntry<E> pairs mapping each token
-/// to its enumerator (e.g. one entry per xs:enumeration facet). Use enum_table()
-/// to build it without spelling the element type or count:
+/// to its enumerator (e.g. one entry per xs:enumeration facet). Use
+/// enum_table() to build it without spelling the element type or count:
 /// @code
 /// template <> struct xml::XmlEnumTraits<Priority> {
 ///   static constexpr auto values = xml::enum_table<Priority>(
