@@ -241,12 +241,32 @@ concept XmlStringLike =
 template <typename T>
 concept XmlPrimitive = std::is_arithmetic_v<T> || XmlStringLike<T>;
 
+/// @brief One token-to-enumerator mapping entry for an XmlEnumTraits table.
+template <typename E>
+using EnumEntry = std::pair<std::string_view, E>;
+
 /// @brief Adapts a C++ enum to/from its XML token spelling. Specialize with a
-/// `values` member: a constexpr range of {std::string_view, E} pairs mapping
-/// each token to its enumerator (e.g. one entry per xs:enumeration facet).
+/// `values` member: a constexpr range of EnumEntry<E> pairs mapping each token
+/// to its enumerator (e.g. one entry per xs:enumeration facet). Use enum_table()
+/// to build it without spelling the element type or count:
+/// @code
+/// template <> struct xml::XmlEnumTraits<Priority> {
+///   static constexpr auto values = xml::enum_table<Priority>(
+///       {{"Low", Priority::Low}, {"High", Priority::High}});
+/// };
+/// @endcode
 /// @tparam E Enum type to map.
 template <typename E>
 struct XmlEnumTraits;
+
+/// @brief Builds an XmlEnumTraits `values` table from a braced list of entries,
+/// deducing the entry count. The enum type E is given explicitly; each entry is
+/// a `{"token", E::value}` pair.
+template <typename E, size_t N>
+constexpr auto enum_table(const EnumEntry<E> (&entries)[N])
+    -> std::array<EnumEntry<E>, N> {
+  return std::to_array(entries);
+}
 
 /// @brief Satisfied when E is an enum with an XmlEnumTraits specialization.
 template <typename E>

@@ -2121,10 +2121,10 @@ TEST_F(TurboBasicTests, StrictParserNormalizes) {
 enum class Priority { Low, Medium, High };
 template <>
 struct xml::XmlEnumTraits<Priority> {
-  static constexpr std::array<std::pair<std::string_view, Priority>, 3> values{
+  static constexpr auto values = xml::enum_table<Priority>(
       {{"Low", Priority::Low},
        {"Medium", Priority::Medium},
-       {"High", Priority::High}}};
+       {"High", Priority::High}});
 };
 
 struct Task {

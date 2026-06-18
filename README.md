@@ -147,14 +147,17 @@ enum class Priority { Low, Medium, High };
 
 template <>
 struct xml::XmlEnumTraits<Priority> {
-  static constexpr std::array<std::pair<std::string_view, Priority>, 3> values{{
-      {"Low", Priority::Low}, {"Medium", Priority::Medium}, {"High", Priority::High}}};
+  static constexpr auto values = xml::enum_table<Priority>({
+      {"Low", Priority::Low}, {"Medium", Priority::Medium}, {"High", Priority::High}});
 };
 
 struct Task {
   Priority priority{};   // xml::attr_field("priority", &Task::priority)
 };
 ```
+
+`enum_table<E>({...})` deduces the entry count for you; a plain
+`static constexpr std::array<xml::EnumEntry<Priority>, N> values{{...}}` works too.
 
 ### Value Fields (element text + attributes)
 
