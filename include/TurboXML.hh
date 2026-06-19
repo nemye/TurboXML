@@ -12,6 +12,7 @@
 #include <cstring>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -226,6 +227,11 @@ template <typename T>
 struct is_unique_ptr : std::false_type {};
 template <typename U, typename D>
 struct is_unique_ptr<std::unique_ptr<U, D>> : std::true_type {};
+
+template <typename T>
+struct is_optional : std::false_type {};
+template <typename U>
+struct is_optional<std::optional<U>> : std::true_type {};
 }  // namespace detail
 
 /// @brief Satisfied when T is a std::unique_ptr to an XmlObject. Such members
@@ -234,6 +240,12 @@ struct is_unique_ptr<std::unique_ptr<U, D>> : std::true_type {};
 template <typename T>
 concept XmlUniquePtr =
     detail::is_unique_ptr<T>::value && XmlObject<typename T::element_type>;
+
+/// @brief Satisfied when T is a std::optional. Such members hold an optional
+/// leaf value or child element: empty when absent, engaged (in place) when
+/// present. An optional field can never be marked required.
+template <typename T>
+concept XmlOptional = detail::is_optional<T>::value;
 
 /// @brief Satisfied when T is std::string or std::string_view.
 template <typename T>
@@ -1150,6 +1162,28 @@ constexpr bool all_names_unique() noexcept {
   return true;
 }
 
+// Compile-time check that no std::optional member is marked required: an
+// optional field is inherently optional, so the combination is rejected.
+template <typename T>
+constexpr bool optionals_not_required() noexcept {
+  bool ok = true;
+  [&]<size_t... I>(std::index_sequence<I...>) {
+    (
+        [&] {
+          constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
+          using M =
+              std::remove_cvref_t<decltype(std::declval<T&>().*(f.member))>;
+          if constexpr (is_optional<M>::value) {
+            if (f.required) {
+              ok = false;
+            }
+          }
+        }(),
+        ...);
+  }(field_seq<T>);
+  return ok;
+}
+
 // ---- Text normalization (owning std::string fields, opt-in) ----
 
 /// @brief How a run of character data is normalized when appended to an owning
@@ -1554,6 +1588,28 @@ class BasicParser {
     } else {
       out = text;
       return true;
+    }
+  }
+
+  // Assigns a matched attribute's value to a leaf member (string normalized
+  // when applicable, otherwise a scalar/enum/custom-value parse).
+  template <typename U>
+  auto assign_attr_value(U& out, const Attribute& a) -> bool {
+    if constexpr (XmlStringLike<U>) {
+      if constexpr (kNormalize && std::same_as<U, std::string>) {
+        out.clear();
+        const ErrorCode ec =
+            detail::append_normalized(out, a.value, detail::NormMode::Attr);
+        // On a bad reference, fail() records the code; the attribute reports
+        // "not matched" and pull() converts the recorded error into a hard fail
+        // right after attribute dispatch.
+        return ec == ErrorCode::None ? true : fail(ec);
+      } else {
+        out = a.value;
+        return true;
+      }
+    } else {
+      return parse_scalar(a.value, out);
     }
   }
 
@@ -2251,21 +2307,17 @@ inline auto BasicParser<Opts>::attr(const FieldHash hash, T& out, size_t& pos)
     pos = idx + 1;
   }
   const Attribute& a = attributes_[idx];
-  if constexpr (XmlStringLike<T>) {
-    if constexpr (kNormalize && std::same_as<T, std::string>) {
-      out.clear();
-      const ErrorCode ec =
-          detail::append_normalized(out, a.value, detail::NormMode::Attr);
-      // On a bad reference, fail() records the code; the attribute reports
-      // "not matched" and pull() converts the recorded error into a hard fail
-      // right after attribute dispatch.
-      return ec == ErrorCode::None ? true : fail(ec);
-    } else {
-      out = a.value;
-      return true;
+  if constexpr (XmlOptional<T>) {
+    // Parse into a temporary so a parse failure leaves the optional empty
+    // (rather than engaged with a half-parsed value).
+    typename T::value_type tmp{};
+    if (!assign_attr_value(tmp, a)) {
+      return false;
     }
+    out = std::move(tmp);
+    return true;
   } else {
-    return parse_scalar(a.value, out);
+    return assign_attr_value(out, a);
   }
 }
 
@@ -2427,6 +2479,9 @@ inline auto BasicParser<Opts>::read_element(std::string_view expected_name,
     // depth guard above bounds recursion; the unwrap keeps the same depth.
     out = std::make_unique<typename T::element_type>();
     return read_element(expected_name, *out, depth);
+  } else if constexpr (XmlOptional<T>) {
+    // Element present -> engage the optional and parse the inner value/object.
+    return read_element(expected_name, out.emplace(), depth);
   } else if constexpr (XmlScalar<T>) {
     if (is_self_closing) {
       if constexpr (XmlStringLike<T>) {
@@ -2477,6 +2532,9 @@ inline auto BasicParser<Opts>::pull(T& object, const uint16_t depth) -> bool {
       detail::all_names_unique<T>(),
       "FNV-1a hash collision among element/attribute/variant names in "
       "XmlMetadata<T>");
+  static_assert(detail::optionals_not_required<T>(),
+                "a std::optional field cannot be marked required (an optional "
+                "field is inherently optional)");
 
   // Per-field fill counters for fixed containers. Only those entries are
   // touched; the compiler elides the rest.
@@ -2744,6 +2802,10 @@ class Serializer {
       if (v) {  // null optional/recursive child: omit the element entirely
         write_element(tag, *v, depth);
       }
+    } else if constexpr (XmlOptional<V>) {
+      if (v) {  // disengaged optional: omit the element entirely
+        write_field_value(tag, *v, depth);
+      }
     } else if constexpr (XmlScalar<V>) {
       write_prim_element(tag, v, depth);
     } else {
@@ -2756,7 +2818,14 @@ class Serializer {
   void write_attr_if(const T& obj) {
     constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
     if constexpr (f.kind == FieldKind::Attr) {
-      write_attr_value(f.xml_name, obj.*(f.member));
+      using M = std::remove_cvref_t<decltype(obj.*(f.member))>;
+      if constexpr (XmlOptional<M>) {
+        if (const auto& m = obj.*(f.member)) {  // omit absent optional attrs
+          write_attr_value(f.xml_name, *m);
+        }
+      } else {
+        write_attr_value(f.xml_name, obj.*(f.member));
+      }
     }
   }
 

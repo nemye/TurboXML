@@ -26,6 +26,9 @@ conformance test suite (`test/test_Conformance.cc`).
   `std::chrono` accessors; malformed input reports `InvalidValue`.
 - `xml::XmlValueTraits<T>` customization point: parse/format any leaf type to and
   from its XML text form (the date types are built-in specializations).
+- `std::optional<T>` element and attribute members: engaged when present, left
+  empty when absent, and omitted on serialization when empty. Marking an optional
+  field `required` is a compile-time error.
 
 ### Changed
 - Required-field presence is tracked in a multiword mask instead of a single

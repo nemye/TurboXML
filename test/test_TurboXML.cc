@@ -2575,3 +2575,55 @@ TEST_F(TurboBasicTests, VariantRepeatedInterleaved) {
   EXPECT_EQ(std::get<VCircle>(d.body[2]).r, 3);
   EXPECT_EQ(xml::serialize<false>("VDoc", d), src);
 }
+
+// std::optional fields (present => engaged, absent => nullopt).
+struct OptAddr {
+  std::string_view city;
+};
+template <>
+struct xml::XmlMetadata<OptAddr> {
+  static constexpr auto fields =
+      std::make_tuple(xml::field("city", &OptAddr::city));
+};
+
+struct OptPerson {
+  std::optional<int> age;                // attribute (scalar inner)
+  std::optional<std::string_view> nick;  // element (scalar inner)
+  std::optional<OptAddr> addr;           // element (object inner)
+};
+template <>
+struct xml::XmlMetadata<OptPerson> {
+  static constexpr auto fields =
+      std::make_tuple(xml::attr_field("age", &OptPerson::age),
+                      xml::field("nick", &OptPerson::nick),
+                      xml::field("addr", &OptPerson::addr));
+};
+
+TEST_F(TurboBasicTests, OptionalAllPresentRoundTrip) {
+  constexpr std::string_view src =
+      R"(<OptPerson age="30"><nick>Al</nick><addr><city>NYC</city></addr></OptPerson>)";
+  xml::Parser p{src};
+  OptPerson pe;
+  ASSERT_TRUE(xml::deserialize(p, "OptPerson", pe));
+  ASSERT_TRUE(pe.age);
+  EXPECT_EQ(*pe.age, 30);
+  ASSERT_TRUE(pe.nick);
+  EXPECT_EQ(*pe.nick, "Al");
+  ASSERT_TRUE(pe.addr);
+  EXPECT_EQ(pe.addr->city, "NYC");
+  EXPECT_EQ(xml::serialize<false>("OptPerson", pe), src);
+}
+
+TEST_F(TurboBasicTests, OptionalAbsentStaysEmptyAndOmitted) {
+  // No attribute, no child elements: every optional stays nullopt and the
+  // serializer omits them.
+  constexpr std::string_view src = R"(<OptPerson age="5"></OptPerson>)";
+  xml::Parser p{src};
+  OptPerson pe;
+  ASSERT_TRUE(xml::deserialize(p, "OptPerson", pe));
+  ASSERT_TRUE(pe.age);
+  EXPECT_EQ(*pe.age, 5);
+  EXPECT_FALSE(pe.nick);
+  EXPECT_FALSE(pe.addr);
+  EXPECT_EQ(xml::serialize<false>("OptPerson", pe), src);  // no <nick>/<addr>
+}

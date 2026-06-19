@@ -134,6 +134,7 @@ type may declare.
 - **Custom leaf types**: any type with an `XmlValueTraits` specialization (text <-> value)
 - **Choices**: `std::variant<...>` (and `std::vector<std::variant<...>>`) via `variant_field` (XSD `xs:choice`)
 - **Nested objects**: any type with an `XmlMetadata` specialization
+- **Optionals**: `std::optional<T>` of any of the above - empty when absent, engaged when present
 - **Optional/recursive children**: `std::unique_ptr<T>` of an `XmlObject` - null when absent, allocated when present
 - **Dynamic containers**: `std::vector<T>` via `vec_field`
 - **Fixed containers**: `std::array<T, N>` via `arr_field`
@@ -183,6 +184,21 @@ struct xml::XmlMetadata<Price> {
       xml::value_field(&Price::amount));
 };
 // used as: xml::field("price", &Order::price)  ->  <price currency="USD">9.99</price>
+```
+
+### Optional Fields
+
+Wrap any element or attribute member in `std::optional<T>`: it is engaged when
+the element/attribute is present and stays empty (`std::nullopt`) when absent.
+The serializer omits a disengaged optional. Because an optional is inherently
+optional, marking such a field `required` is a compile-time error.
+
+```cpp
+struct Person {
+  std::optional<int> age;                // xml::attr_field("age", &Person::age)
+  std::optional<std::string_view> nick;  // xml::field("nick", &Person::nick)
+  std::optional<Address> addr;           // xml::field("addr", &Person::addr)
+};
 ```
 
 ### Recursive Types
