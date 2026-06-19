@@ -108,7 +108,7 @@ int main() {
 | `xml::attr_field("name", &T::member)` | Attribute: maps `name="value"` on the parent tag |
 | `xml::vec_field("name", &T::member)` | Repeated element: appends each `<name>` to a dynamic container |
 | `xml::arr_field("name", &T::member)` | Repeated element: fills a fixed-capacity container sequentially; skips overflow |
-| `xml::value_field(&T::member)` | The element's **own text** (XSD simpleContent); takes no name — see below |
+| `xml::value_field(&T::member)` | The element's **own text** (XSD simpleContent); takes no name - see below |
 
 All five factories accept an optional trailing `required` flag (default `false`,
 i.e. fields are optional). When `true`, `deserialize()` fails with
@@ -130,8 +130,11 @@ type may declare.
 - **Booleans**: `bool`, parsed from `true`/`false`/`1`/`0`, serialized as `true`/`false`
 - **Strings**: `std::string_view` (zero-copy, must outlive source), `std::string` (owning copy)
 - **Enums**: any C++ `enum` with an `XmlEnumTraits` specialization (maps token spellings, e.g. `xs:enumeration`)
+- **Dates & times**: `xml::Date`, `xml::Time`, `xml::DateTime` (XSD `date`/`time`/`dateTime`), with `std::chrono` accessors
+- **Custom leaf types**: any type with an `XmlValueTraits` specialization (text <-> value)
+- **Choices**: `std::variant<...>` (and `std::vector<std::variant<...>>`) via `variant_field` (XSD `xs:choice`)
 - **Nested objects**: any type with an `XmlMetadata` specialization
-- **Optional/recursive children**: `std::unique_ptr<T>` of an `XmlObject` — null when absent, allocated when present
+- **Optional/recursive children**: `std::unique_ptr<T>` of an `XmlObject` - null when absent, allocated when present
 - **Dynamic containers**: `std::vector<T>` via `vec_field`
 - **Fixed containers**: `std::array<T, N>` via `arr_field`
 
@@ -162,7 +165,7 @@ struct Task {
 ### Value Fields (element text + attributes)
 
 `xml::value_field` binds an element's **own character data** to a member while
-attribute fields on the same element still apply — XSD `simpleContent`, e.g.
+attribute fields on the same element still apply - XSD `simpleContent`, e.g.
 `<price currency="USD">9.99</price>`. It takes no XML name (the name comes from
 where the type is referenced) and the member must be a scalar
 (string/number/enum). A type with a value field must not also declare child
@@ -195,6 +198,57 @@ struct Section {
   std::unique_ptr<Section> subsection;  // xml::field("subsection", &Section::subsection)
 };
 ```
+
+### Choices / Variants
+
+Map an XSD `xs:choice` to a `std::variant<...>` member with `variant_field`,
+binding each element name to an alternative via `alt<T>("name")` (alternatives
+must be distinct types). The matched element selects the alternative; the
+serializer emits the active one under its name.
+
+```cpp
+struct Circle { int r{}; };   // (each with its own XmlMetadata)
+struct Square { int s{}; };
+
+struct Shape {
+  std::variant<Circle, Square> kind;
+};
+template <>
+struct xml::XmlMetadata<Shape> {
+  static constexpr auto fields = std::make_tuple(
+      xml::variant_field(&Shape::kind,
+          xml::alt<Circle>("circle"), xml::alt<Square>("square")));
+};
+// <Shape><circle r="3"/></Shape>   or   <Shape><square s="7"/></Shape>
+```
+
+- A plain `std::variant` models *exactly one* branch. Use
+  `required_variant_field` to require that a branch be present (`minOccurs ≥ 1`,
+  else `ErrorCode::MissingRequiredField`).
+- For a repeated/interleaved choice (`maxOccurs > 1`), use a dynamic container of
+  variant, e.g. `std::vector<std::variant<P, Img, Table>>`; an empty vector means
+  the choice never occurred.
+
+### Dates & Times
+
+`xml::Date`, `xml::Time`, and `xml::DateTime` parse the XSD `date` / `time` /
+`dateTime` lexical forms (optional `Z` / `±hh:mm` timezone, fractional seconds)
+and round-trip through the serializer. Bad input fails with
+`ErrorCode::InvalidValue`. Each exposes `std::chrono` accessors.
+
+```cpp
+struct Event {
+  xml::Date     day;     // xml::attr_field("day", &Event::day)
+  xml::DateTime stamp;   // xml::field("stamp", &Event::stamp)
+};
+// ... after deserialize:
+std::chrono::sys_days d = event.day.to_sys_days();
+std::chrono::sys_time<std::chrono::nanoseconds> t = event.stamp.to_sys_time(); // UTC
+```
+
+Any other leaf type with a known text form can be supported by specializing
+`xml::XmlValueTraits<T>` with `parse(std::string_view, T&)` and
+`format(std::string&, const T&)` - the same hook the date types use.
 
 ### Deserializer
 

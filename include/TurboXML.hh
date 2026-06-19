@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <tuple>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace xml {
@@ -62,12 +64,13 @@ enum class ErrorCode : uint8_t {
   UnterminatedCData,    ///< CDATA section with no "]]>".
   UnterminatedPi,       ///< PI with no "?>".
   // Content / structure
-  InvalidNumericValue,   ///< Numeric/bool field text failed to parse.
-  InvalidEnumValue,      ///< Enum field text matched no XmlEnumTraits token.
-  RootElementNotFound,   ///< Requested root element not present.
-  ElementMismatch,       ///< End-tag name does not match its start-tag.
-  UnexpectedEof,         ///< Input ended mid-element.
-  DepthExceeded,         ///< Nesting deeper than kMaxDepth.
+  InvalidNumericValue,  ///< Numeric/bool field text failed to parse.
+  InvalidEnumValue,     ///< Enum field text matched no XmlEnumTraits token.
+  InvalidValue,         ///< Custom-value (e.g. date/time) text failed to parse.
+  RootElementNotFound,  ///< Requested root element not present.
+  ElementMismatch,      ///< End-tag name does not match its start-tag.
+  UnexpectedEof,        ///< Input ended mid-element.
+  DepthExceeded,        ///< Nesting deeper than kMaxDepth.
   MissingRequiredField,  ///< A field marked required was absent from the
                          ///< element.
   UndefinedEntity,       ///< Reference to an entity that is not one of the five
@@ -120,7 +123,7 @@ constexpr FieldHash hash_field_name(std::string_view s) noexcept {
 }  // namespace detail
 
 /// @brief Classifies a field as a child element, attribute, or container.
-enum class FieldKind : uint8_t { Element, Attr, Container, Value };
+enum class FieldKind : uint8_t { Element, Attr, Container, Value, Variant };
 
 /// @brief Compile-time descriptor binding an XML name to a class data member.
 /// @tparam K      Field kind.
@@ -272,11 +275,381 @@ constexpr auto enum_table(const EnumEntry<E> (&entries)[N])
 template <typename E>
 concept XmlEnum = std::is_enum_v<E> && requires { XmlEnumTraits<E>::values; };
 
-/// @brief Satisfied when T is a leaf value type: a primitive (arithmetic or
-/// string-like) or a mapped enum. These map to an element's text or an
-/// attribute value, as opposed to a nested XmlObject.
+/// @brief Adapts an arbitrary leaf type to/from its XML text form. Specialize
+/// with two static members:
+///   `static bool parse(std::string_view, T&);`     // false on bad input
+///   `static void format(std::string& out, const T&);`  // append XML-safe text
+/// The built-in xml::Date / xml::Time / xml::DateTime types specialize this;
+/// the same hook lets the codegen map any simple type with a known lexical
+/// form.
+/// @tparam T Leaf value type to map.
 template <typename T>
-concept XmlScalar = XmlPrimitive<T> || XmlEnum<T>;
+struct XmlValueTraits;
+
+/// @brief Satisfied when T has an XmlValueTraits specialization (a custom leaf
+/// value type with text parse/format, e.g. a date).
+template <typename T>
+concept XmlCustomValue =
+    requires(std::string_view s, T& v, const T& cv, std::string& out) {
+      { XmlValueTraits<T>::parse(s, v) } -> std::same_as<bool>;
+      XmlValueTraits<T>::format(out, cv);
+    };
+
+/// @brief Satisfied when T is a leaf value type: a primitive (arithmetic or
+/// string-like), a mapped enum, or a custom value (XmlValueTraits). These map
+/// to an element's text or an attribute value, as opposed to a nested
+/// XmlObject.
+template <typename T>
+concept XmlScalar = XmlPrimitive<T> || XmlEnum<T> || XmlCustomValue<T>;
+
+// ---- Built-in date/time value types (XSD date / dateTime / time) ----
+
+/// @brief An XSD `date`: a proleptic Gregorian calendar date with an optional
+/// timezone. Construct from XML via a field typed `xml::Date`; obtain chrono
+/// values via the accessors.
+struct Date {
+  int year{};           ///< Proleptic Gregorian year (may be negative).
+  unsigned month{};     ///< 1-12.
+  unsigned day{};       ///< 1-31.
+  bool has_tz{};        ///< True if an explicit timezone was present.
+  int tz_offset_min{};  ///< Minutes east of UTC (0 for 'Z').
+
+  [[nodiscard]] constexpr auto to_year_month_day() const
+      -> std::chrono::year_month_day {
+    return std::chrono::year{year} / std::chrono::month{month} /
+           std::chrono::day{day};
+  }
+  [[nodiscard]] constexpr auto to_sys_days() const -> std::chrono::sys_days {
+    return std::chrono::sys_days{to_year_month_day()};
+  }
+  auto operator==(const Date&) const -> bool = default;
+};
+
+/// @brief An XSD `time`: time of day with optional fractional seconds and an
+/// optional timezone.
+struct Time {
+  unsigned hour{};    ///< 0-24 (24 only with zero minute/second/fraction).
+  unsigned minute{};  ///< 0-59.
+  unsigned second{};  ///< 0-59.
+  std::uint32_t nanosecond{};  ///< Fractional second, in nanoseconds.
+  bool has_tz{};
+  int tz_offset_min{};
+
+  /// @brief Time elapsed since midnight (ignores any timezone).
+  [[nodiscard]] constexpr auto since_midnight() const
+      -> std::chrono::nanoseconds {
+    using namespace std::chrono;
+    return hours{hour} + minutes{minute} + seconds{second} +
+           nanoseconds{nanosecond};
+  }
+  auto operator==(const Time&) const -> bool = default;
+};
+
+/// @brief An XSD `dateTime`: a `Date` and `Time`; any timezone is carried on
+/// the time component.
+struct DateTime {
+  Date date{};
+  Time time{};
+
+  /// @brief The instant as a UTC `sys_time` (applies the timezone offset if one
+  /// was present; otherwise treats the value as UTC).
+  [[nodiscard]] auto to_sys_time() const
+      -> std::chrono::sys_time<std::chrono::nanoseconds> {
+    using namespace std::chrono;
+    sys_time<nanoseconds> t = date.to_sys_days() + time.since_midnight();
+    if (time.has_tz) {
+      t -= minutes{time.tz_offset_min};
+    }
+    return t;
+  }
+  auto operator==(const DateTime&) const -> bool = default;
+};
+
+namespace detail {
+
+// ---- Lexical scanners for the date/time types (allocation-free) ----
+
+// Reads exactly `n` decimal digits into `out`, advancing `i`. False if fewer.
+constexpr auto dt_digits(std::string_view s, size_t& i, int n, unsigned& out)
+    -> bool {
+  if (i + static_cast<size_t>(n) > s.size()) {
+    return false;
+  }
+  unsigned v = 0;
+  for (int k = 0; k < n; ++k) {
+    const char c = s[i + static_cast<size_t>(k)];
+    if (c < '0' || c > '9') {
+      return false;
+    }
+    v = v * 10 + static_cast<unsigned>(c - '0');
+  }
+  i += static_cast<size_t>(n);
+  out = v;
+  return true;
+}
+
+// Year: optional '-' then at least four digits.
+constexpr auto dt_year(std::string_view s, size_t& i, int& year) -> bool {
+  int sign = 1;
+  if (i < s.size() && s[i] == '-') {
+    sign = -1;
+    ++i;
+  }
+  const size_t start = i;
+  long v = 0;
+  while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+    v = v * 10 + (s[i] - '0');
+    ++i;
+  }
+  if (i - start < 4) {
+    return false;
+  }
+  year = sign * static_cast<int>(v);
+  return true;
+}
+
+// Optional timezone suffix: 'Z' or (+|-)hh:mm. Absent (i at end) is allowed.
+constexpr auto dt_tz(std::string_view s, size_t& i, bool& has_tz, int& off)
+    -> bool {
+  has_tz = false;
+  off = 0;
+  if (i >= s.size()) {
+    return true;
+  }
+  const char c = s[i];
+  if (c == 'Z') {
+    has_tz = true;
+    ++i;
+    return true;
+  }
+  if (c == '+' || c == '-') {
+    const int sign = (c == '-') ? -1 : 1;
+    ++i;
+    unsigned hh = 0;
+    unsigned mm = 0;
+    if (!dt_digits(s, i, 2, hh) || i >= s.size() || s[i] != ':') {
+      return false;
+    }
+    ++i;
+    if (!dt_digits(s, i, 2, mm) || hh > 14 || mm > 59) {
+      return false;
+    }
+    has_tz = true;
+    off = sign * static_cast<int>(hh * 60 + mm);
+    return true;
+  }
+  return false;
+}
+
+constexpr auto dt_date(std::string_view s, size_t& i, Date& d) -> bool {
+  unsigned mo = 0;
+  unsigned da = 0;
+  if (!dt_year(s, i, d.year) || i >= s.size() || s[i] != '-') {
+    return false;
+  }
+  ++i;
+  if (!dt_digits(s, i, 2, mo) || i >= s.size() || s[i] != '-') {
+    return false;
+  }
+  ++i;
+  if (!dt_digits(s, i, 2, da) || mo < 1 || mo > 12 || da < 1 || da > 31) {
+    return false;
+  }
+  d.month = mo;
+  d.day = da;
+  return true;
+}
+
+constexpr auto dt_time(std::string_view s, size_t& i, Time& t) -> bool {
+  unsigned hh = 0;
+  unsigned mm = 0;
+  unsigned ss = 0;
+  if (!dt_digits(s, i, 2, hh) || i >= s.size() || s[i] != ':') {
+    return false;
+  }
+  ++i;
+  if (!dt_digits(s, i, 2, mm) || i >= s.size() || s[i] != ':') {
+    return false;
+  }
+  ++i;
+  if (!dt_digits(s, i, 2, ss)) {
+    return false;
+  }
+  std::uint32_t nano = 0;
+  if (i < s.size() && s[i] == '.') {
+    ++i;
+    const size_t frac_start = i;
+    std::uint64_t frac = 0;
+    int digits = 0;
+    while (i < s.size() && s[i] >= '0' && s[i] <= '9') {
+      if (digits < 9) {
+        frac = frac * 10 + static_cast<unsigned>(s[i] - '0');
+        ++digits;
+      }
+      ++i;
+    }
+    if (i == frac_start) {
+      return false;  // '.' with no digits
+    }
+    while (digits < 9) {
+      frac *= 10;
+      ++digits;
+    }
+    nano = static_cast<std::uint32_t>(frac);
+  }
+  if (hh > 24 || mm > 59 || ss > 59 || (hh == 24 && (mm || ss || nano))) {
+    return false;
+  }
+  t.hour = hh;
+  t.minute = mm;
+  t.second = ss;
+  t.nanosecond = nano;
+  return true;
+}
+
+constexpr auto parse_date(std::string_view s, Date& d) -> bool {
+  size_t i = 0;
+  Date out{};
+  if (!dt_date(s, i, out) || !dt_tz(s, i, out.has_tz, out.tz_offset_min) ||
+      i != s.size()) {
+    return false;
+  }
+  d = out;
+  return true;
+}
+
+constexpr auto parse_time(std::string_view s, Time& t) -> bool {
+  size_t i = 0;
+  Time out{};
+  if (!dt_time(s, i, out) || !dt_tz(s, i, out.has_tz, out.tz_offset_min) ||
+      i != s.size()) {
+    return false;
+  }
+  t = out;
+  return true;
+}
+
+constexpr auto parse_datetime(std::string_view s, DateTime& dt) -> bool {
+  size_t i = 0;
+  DateTime out{};
+  if (!dt_date(s, i, out.date) || i >= s.size() || s[i] != 'T') {
+    return false;
+  }
+  ++i;
+  if (!dt_time(s, i, out.time) ||
+      !dt_tz(s, i, out.time.has_tz, out.time.tz_offset_min) || i != s.size()) {
+    return false;
+  }
+  dt = out;
+  return true;
+}
+
+// ---- Canonical-form formatters ----
+
+inline void dt_pad(std::string& o, unsigned v, int width) {
+  char tmp[10];
+  int n = 0;
+  do {
+    tmp[n++] = static_cast<char>('0' + v % 10);
+    v /= 10;
+  } while (v != 0);
+  for (int k = n; k < width; ++k) {
+    o.push_back('0');
+  }
+  while (n != 0) {
+    o.push_back(tmp[--n]);
+  }
+}
+
+inline void dt_fmt_tz(std::string& o, bool has_tz, int off) {
+  if (!has_tz) {
+    return;
+  }
+  if (off == 0) {
+    o.push_back('Z');
+    return;
+  }
+  o.push_back(off < 0 ? '-' : '+');
+  const unsigned a = static_cast<unsigned>(off < 0 ? -off : off);
+  dt_pad(o, a / 60, 2);
+  o.push_back(':');
+  dt_pad(o, a % 60, 2);
+}
+
+inline void dt_fmt_date(std::string& o, const Date& d) {
+  if (d.year < 0) {
+    o.push_back('-');
+    dt_pad(o, static_cast<unsigned>(-d.year), 4);
+  } else {
+    dt_pad(o, static_cast<unsigned>(d.year), 4);
+  }
+  o.push_back('-');
+  dt_pad(o, d.month, 2);
+  o.push_back('-');
+  dt_pad(o, d.day, 2);
+}
+
+inline void dt_fmt_time(std::string& o, const Time& t) {
+  dt_pad(o, t.hour, 2);
+  o.push_back(':');
+  dt_pad(o, t.minute, 2);
+  o.push_back(':');
+  dt_pad(o, t.second, 2);
+  if (t.nanosecond != 0) {
+    char d[9];
+    std::uint32_t n = t.nanosecond;
+    for (int k = 8; k >= 0; --k) {
+      d[k] = static_cast<char>('0' + n % 10);
+      n /= 10;
+    }
+    int len = 9;
+    while (len > 1 && d[len - 1] == '0') {
+      --len;
+    }
+    o.push_back('.');
+    o.append(d, static_cast<size_t>(len));
+  }
+}
+
+}  // namespace detail
+
+/// @brief Maps xml::Date to/from the XSD `date` lexical form.
+template <>
+struct XmlValueTraits<Date> {
+  static auto parse(std::string_view s, Date& d) -> bool {
+    return detail::parse_date(s, d);
+  }
+  static void format(std::string& out, const Date& d) {
+    detail::dt_fmt_date(out, d);
+    detail::dt_fmt_tz(out, d.has_tz, d.tz_offset_min);
+  }
+};
+
+/// @brief Maps xml::Time to/from the XSD `time` lexical form.
+template <>
+struct XmlValueTraits<Time> {
+  static auto parse(std::string_view s, Time& t) -> bool {
+    return detail::parse_time(s, t);
+  }
+  static void format(std::string& out, const Time& t) {
+    detail::dt_fmt_time(out, t);
+    detail::dt_fmt_tz(out, t.has_tz, t.tz_offset_min);
+  }
+};
+
+/// @brief Maps xml::DateTime to/from the XSD `dateTime` lexical form.
+template <>
+struct XmlValueTraits<DateTime> {
+  static auto parse(std::string_view s, DateTime& dt) -> bool {
+    return detail::parse_datetime(s, dt);
+  }
+  static void format(std::string& out, const DateTime& dt) {
+    detail::dt_fmt_date(out, dt.date);
+    out.push_back('T');
+    detail::dt_fmt_time(out, dt.time);
+    detail::dt_fmt_tz(out, dt.time.has_tz, dt.time.tz_offset_min);
+  }
+};
 
 namespace detail {
 
@@ -365,6 +738,108 @@ concept XmlFixedContainer = requires(C& c, size_t i) {
   } -> std::same_as<typename XmlContainerTraits<C>::value_type&>;
 };
 
+// ---- Variant fields (xs:choice -> std::variant) ----
+namespace detail {
+template <typename T>
+struct is_variant : std::false_type {};
+template <typename... Ts>
+struct is_variant<std::variant<Ts...>> : std::true_type {};
+
+// The std::variant underlying a variant field member: the member itself when it
+// is a variant, else the element type of a dynamic container of variant.
+template <typename M, bool = is_variant<M>::value>
+struct variant_member {
+  using type = M;
+};
+template <typename M>
+struct variant_member<M, false> {
+  using type = typename XmlContainerTraits<M>::value_type;
+};
+template <typename M>
+using variant_member_t = typename variant_member<M>::type;
+
+// Index of alternative T within std::variant V (T must appear exactly once).
+template <typename V, typename T>
+struct variant_index;
+template <typename T, typename... Rest>
+struct variant_index<std::variant<T, Rest...>, T> {
+  static constexpr size_t value = 0;
+};
+template <typename T, typename U, typename... Rest>
+struct variant_index<std::variant<U, Rest...>, T> {
+  static constexpr size_t value =
+      1 + variant_index<std::variant<Rest...>, T>::value;
+};
+}  // namespace detail
+
+/// @brief One alternative of a variant field: binds element `<name>` to the
+/// std::variant alternative of type T. Build with `xml::alt<T>("name")`.
+template <typename T>
+struct VariantAlt {
+  std::string_view name;
+};
+
+/// @brief Names a variant alternative. @tparam T the std::variant alternative.
+template <typename T>
+constexpr auto alt(std::string_view name) -> VariantAlt<T> {
+  return {name};
+}
+
+/// @brief Descriptor for a variant (xs:choice) field. `names` and `hashes` are
+/// indexed by the std::variant alternative index.
+template <typename Class, typename Member, size_t NAlts>
+struct VariantField {
+  static constexpr FieldKind kind = FieldKind::Variant;
+  Member Class::* member;
+  bool required;
+  std::array<std::string_view, NAlts> names;
+  std::array<FieldHash, NAlts> hashes;
+};
+
+namespace detail {
+template <typename V, typename C, typename Member, size_t N, typename T>
+constexpr void place_variant_alt(VariantField<C, Member, N>& f,
+                                 VariantAlt<T> a) {
+  constexpr size_t idx = variant_index<V, T>::value;
+  f.names[idx] = a.name;
+  f.hashes[idx] = hash_field_name(a.name);
+}
+
+template <typename C, typename Member, typename... Ts>
+constexpr auto make_variant_field(Member C::* m, bool required,
+                                  VariantAlt<Ts>... alts) {
+  using V = variant_member_t<Member>;
+  constexpr size_t N = std::variant_size_v<V>;
+  static_assert(sizeof...(Ts) == N,
+                "variant_field: provide exactly one alt<T>() per std::variant "
+                "alternative");
+  VariantField<C, Member, N> f{m, required, {}, {}};
+  (place_variant_alt<V>(f, alts), ...);
+  return f;
+}
+}  // namespace detail
+
+/// @brief Creates an optional variant (xs:choice) field. The member is a
+/// `std::variant<...>` (exactly one branch) or a dynamic container of variant
+/// (a repeated/interleaved choice). Each `alt<T>("name")` binds an element name
+/// to the alternative of type T; alternatives must be distinct types.
+/// @code
+/// std::variant<Circle, Square> shape;  // member
+/// xml::variant_field(&Shapes::shape, xml::alt<Circle>("circle"),
+///                                    xml::alt<Square>("square"));
+/// @endcode
+template <typename C, typename Member, typename... Ts>
+constexpr auto variant_field(Member C::* m, VariantAlt<Ts>... alts) {
+  return detail::make_variant_field(m, false, alts...);
+}
+
+/// @brief Like variant_field, but required: deserialize() fails with
+/// MissingRequiredField if no alternative is matched (xs:choice minOccurs>=1).
+template <typename C, typename Member, typename... Ts>
+constexpr auto required_variant_field(Member C::* m, VariantAlt<Ts>... alts) {
+  return detail::make_variant_field(m, true, alts...);
+}
+
 // Compile-time field introspection
 namespace detail {
 
@@ -388,20 +863,42 @@ constexpr auto map_fields(Proj proj) noexcept {
   }(field_seq<T>);
 }
 
+// Variant fields carry per-alternative names/hashes rather than a single
+// xml_name/hash, so the per-field projections fall back to a sentinel for them;
+// they are matched via the separate variant tables, never these.
 template <typename T>
 constexpr auto make_field_hashes() noexcept {
-  return map_fields<FieldHash, T>([](const auto& f) { return f.hash; });
+  return map_fields<FieldHash, T>([](const auto& f) -> FieldHash {
+    if constexpr (requires { f.hash; }) {
+      return f.hash;
+    } else {
+      return FieldHash{0};
+    }
+  });
 }
 
 template <typename T>
 constexpr auto make_field_names() noexcept {
-  return map_fields<std::string_view, T>(
-      [](const auto& f) { return f.xml_name; });
+  return map_fields<std::string_view, T>([](const auto& f) -> std::string_view {
+    if constexpr (requires { f.xml_name; }) {
+      return f.xml_name;
+    } else {
+      return std::string_view{};
+    }
+  });
 }
 
 template <typename T>
 constexpr auto make_field_kinds() noexcept {
   return map_fields<FieldKind, T>([](const auto& f) { return f.kind; });
+}
+
+/// @brief Kinds matched against a child element by their own single name/hash
+/// in find_field_index (element/attribute/container). Value and Variant fields
+/// are matched by other means and excluded here.
+constexpr bool is_named_field(FieldKind k) noexcept {
+  return k == FieldKind::Element || k == FieldKind::Attr ||
+         k == FieldKind::Container;
 }
 
 template <typename T>
@@ -495,6 +992,14 @@ constexpr bool has_value_field() noexcept {
                              [](FieldKind k) { return k == FieldKind::Value; });
 }
 
+/// @brief True if T declares a variant (xs:choice) field.
+template <typename T>
+constexpr bool has_variant_fields() noexcept {
+  constexpr auto kinds = make_field_kinds<T>();
+  return std::ranges::any_of(
+      kinds, [](FieldKind k) { return k == FieldKind::Variant; });
+}
+
 /// @brief Index of T's first value field (only meaningful when one exists).
 template <typename T>
 constexpr auto value_field_index() noexcept -> size_t {
@@ -540,13 +1045,104 @@ constexpr auto make_next_elem_table() noexcept {
   return next;
 }
 
-// Compile-time check that no two field names in a type produce the same
-// FNV-1a hash. Fires via static_assert in pull() for every deserialized type.
-template <size_t N>
-constexpr bool all_unique(const std::array<FieldHash, N>& arr) noexcept {
-  for (size_t i = 0; i < N; ++i) {
-    for (size_t j = i + 1; j < N; ++j) {
-      if (arr[i] == arr[j]) {
+// ---- Variant (xs:choice) matcher tables ----
+
+/// @brief A single (variant field, alternative) match target: the alternative's
+/// element-name hash, the field's index, and the std::variant alternative
+/// index.
+struct VariantMatcher {
+  FieldHash hash;
+  size_t field_index;
+  size_t alt_index;
+};
+
+/// @brief Total number of variant alternatives across all of T's variant
+/// fields.
+template <typename T>
+constexpr auto variant_matcher_count() noexcept -> size_t {
+  size_t n = 0;
+  [&]<size_t... I>(std::index_sequence<I...>) {
+    (
+        [&] {
+          constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
+          if constexpr (f.kind == FieldKind::Variant) {
+            n += f.names.size();
+          }
+        }(),
+        ...);
+  }(field_seq<T>);
+  return n;
+}
+
+/// @brief Flat (field_index, alt_index) pairs over every variant alternative,
+/// in declaration order then alternative order. Drives both the matcher table
+/// and the handler table so they stay aligned.
+template <typename T>
+constexpr auto variant_pairs() noexcept {
+  std::array<std::pair<size_t, size_t>, variant_matcher_count<T>()> out{};
+  size_t w = 0;
+  [&]<size_t... I>(std::index_sequence<I...>) {
+    (
+        [&] {
+          constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
+          if constexpr (f.kind == FieldKind::Variant) {
+            for (size_t a = 0; a < f.names.size(); ++a) {
+              out[w++] = {I, a};
+            }
+          }
+        }(),
+        ...);
+  }(field_seq<T>);
+  return out;
+}
+
+/// @brief Matcher table aligned with variant_pairs(): one entry per
+/// alternative.
+template <typename T>
+constexpr auto make_variant_matchers() noexcept {
+  std::array<VariantMatcher, variant_matcher_count<T>()> out{};
+  size_t w = 0;
+  [&]<size_t... I>(std::index_sequence<I...>) {
+    (
+        [&] {
+          constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
+          if constexpr (f.kind == FieldKind::Variant) {
+            for (size_t a = 0; a < f.names.size(); ++a) {
+              out[w++] = {f.hashes[a], I, a};
+            }
+          }
+        }(),
+        ...);
+  }(field_seq<T>);
+  return out;
+}
+
+// Compile-time check that no two element names collide under FNV-1a: among the
+// named (element/attribute/container) fields, and across variant alternatives
+// (which must be unique among themselves and disjoint from named fields).
+template <typename T>
+constexpr bool all_names_unique() noexcept {
+  constexpr auto hashes = make_field_hashes<T>();
+  constexpr auto kinds = make_field_kinds<T>();
+  for (size_t i = 0; i < hashes.size(); ++i) {
+    if (!is_named_field(kinds[i])) {
+      continue;
+    }
+    for (size_t j = i + 1; j < hashes.size(); ++j) {
+      if (is_named_field(kinds[j]) && hashes[i] == hashes[j]) {
+        return false;
+      }
+    }
+  }
+  constexpr auto vm = make_variant_matchers<T>();
+  for (size_t i = 0; i < vm.size(); ++i) {
+    for (size_t j = i + 1; j < vm.size(); ++j) {
+      if (vm[i].hash == vm[j].hash) {
+        return false;
+      }
+    }
+    for (size_t j = 0; j < hashes.size(); ++j) {
+      if (is_named_field(kinds[j]) && hashes[j] == vm[i].hash) {
         return false;
       }
     }
@@ -849,11 +1445,14 @@ class BasicParser {
   template <typename T>
   static auto parse_numeric(std::string_view text, T& out) noexcept -> bool;
 
-  // Parse a non-string scalar (arithmetic/bool, or a mapped enum) from text.
+  // Parse a non-string scalar (arithmetic/bool, a mapped enum, or a custom
+  // value type such as a date) from text.
   template <typename T>
-  static auto parse_scalar(std::string_view text, T& out) noexcept -> bool {
+  static auto parse_scalar(std::string_view text, T& out) -> bool {
     if constexpr (XmlEnum<T>) {
       return detail::enum_from_string(text, out);
+    } else if constexpr (XmlCustomValue<T>) {
+      return XmlValueTraits<T>::parse(text, out);
     } else {
       return parse_numeric(text, out);
     }
@@ -862,8 +1461,13 @@ class BasicParser {
   // Error code reported when parse_scalar<T> fails on element text.
   template <typename T>
   static constexpr auto scalar_error() noexcept -> ErrorCode {
-    return XmlEnum<T> ? ErrorCode::InvalidEnumValue
-                      : ErrorCode::InvalidNumericValue;
+    if constexpr (XmlEnum<T>) {
+      return ErrorCode::InvalidEnumValue;
+    } else if constexpr (XmlCustomValue<T>) {
+      return ErrorCode::InvalidValue;
+    } else {
+      return ErrorCode::InvalidNumericValue;
+    }
   }
 
   [[nodiscard]] auto at_end() const noexcept -> bool { return cur_ >= end_; }
@@ -1216,11 +1820,13 @@ class BasicParser {
       parsed.set(I);
     }
     constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
-    if constexpr (f.kind == FieldKind::Attr || f.kind == FieldKind::Value) {
+    if constexpr (f.kind == FieldKind::Attr || f.kind == FieldKind::Value ||
+                  f.kind == FieldKind::Variant) {
       // Attr fields are handled before the element loop; value fields carry the
-      // element's own text (handled directly in pull). Neither is matched as a
-      // child element, so this handler is never invoked for them at runtime --
-      // it exists only because the dispatch table is built over all indices.
+      // element's own text; variant fields match via the variant tables. None
+      // is matched as a child element by its own name, so this handler is never
+      // invoked for them at runtime -- it exists only because the field-indexed
+      // dispatch table is built over all indices.
       p.skip_element();
       return true;
     } else if constexpr (f.kind == FieldKind::Container) {
@@ -1272,6 +1878,44 @@ class BasicParser {
     using Handler = bool (*)(BasicParser&, T&, uint16_t, std::span<size_t>,
                              detail::RequiredMaskT<T>&);
     return std::array<Handler, sizeof...(I)>{&read_field<T, I>...};
+  }
+
+  // Handle a matched variant alternative: field FieldI's element matched its
+  // alternative AltJ. Emplaces that alternative (into the variant, or into a
+  // freshly pushed slot for a repeated/container choice) and reads into it.
+  template <typename T, size_t FieldI, size_t AltJ>
+  static bool read_variant(BasicParser& p, T& obj, uint16_t depth,
+                           detail::RequiredMaskT<T>& parsed) {
+    constexpr auto& f = std::get<FieldI>(XmlMetadata<T>::fields);
+    using Member = std::decay_t<decltype(obj.*(f.member))>;
+    if constexpr (detail::make_required_mask<T>().any()) {
+      parsed.set(FieldI);
+    }
+    if constexpr (detail::is_variant<Member>::value) {
+      auto& var = obj.*(f.member);
+      var.template emplace<AltJ>();
+      return p.read_element(f.names[AltJ], std::get<AltJ>(var), depth + 1);
+    } else {
+      using Traits = XmlContainerTraits<Member>;
+      auto& container = obj.*(f.member);
+      auto& slot = Traits::emplace(container);
+      slot.template emplace<AltJ>();
+      if (!p.read_element(f.names[AltJ], std::get<AltJ>(slot), depth + 1)) {
+        Traits::pop(container);
+        return false;
+      }
+      return true;
+    }
+  }
+
+  template <typename T, size_t... K>
+  static constexpr auto build_variant_dispatch(
+      std::index_sequence<K...>) noexcept {
+    using Handler =
+        bool (*)(BasicParser&, T&, uint16_t, detail::RequiredMaskT<T>&);
+    constexpr auto pairs = detail::variant_pairs<T>();
+    return std::array<Handler, sizeof...(K)>{
+        &read_variant<T, pairs[K].first, pairs[K].second>...};
   }
 
   template <typename T, size_t... I>
@@ -1829,8 +2473,10 @@ template <typename T>
 inline auto BasicParser<Opts>::pull(T& object, const uint16_t depth) -> bool {
   constexpr size_t N = detail::field_count<T>;
   constexpr auto kIdxSeq = detail::field_seq<T>;
-  static_assert(detail::all_unique(detail::make_field_hashes<T>()),
-                "FNV-1a hash collision among field names in XmlMetadata<T>");
+  static_assert(
+      detail::all_names_unique<T>(),
+      "FNV-1a hash collision among element/attribute/variant names in "
+      "XmlMetadata<T>");
 
   // Per-field fill counters for fixed containers. Only those entries are
   // touched; the compiler elides the rest.
@@ -1906,6 +2552,7 @@ inline auto BasicParser<Opts>::pull(T& object, const uint16_t depth) -> bool {
   // XML hits the memcmp fast path below on every element; out-of-order
   // documents miss once, re-sync at the dispatch site, and stay correct.
   constexpr bool kHasElems = detail::has_element_fields<T>();
+  constexpr bool kHasVariants = detail::has_variant_fields<T>();
   static constexpr auto dispatch = build_elem_dispatch<T>(kIdxSeq);
   static constexpr auto kNames = detail::make_field_names<T>();
   static constexpr auto kNextElem = detail::make_next_elem_table<T>();
@@ -1958,7 +2605,28 @@ inline auto BasicParser<Opts>::pull(T& object, const uint16_t depth) -> bool {
 
     const size_t idx = detail::find_field_index<T>(token->name_hash);
     if (idx >= N) {
-      skip_current();
+      // No named field matched. A variant (xs:choice) alternative might; this
+      // path is compiled out entirely for types with no variant field.
+      bool handled = false;
+      if constexpr (kHasVariants) {
+        static constexpr auto kVariantMatch =
+            detail::make_variant_matchers<T>();
+        static constexpr auto variant_dispatch = build_variant_dispatch<T>(
+            std::make_index_sequence<kVariantMatch.size()>{});
+        for (size_t k = 0; k < kVariantMatch.size(); ++k) {
+          if (kVariantMatch[k].hash == token->name_hash) {
+            consume_peeked();
+            if (!variant_dispatch[k](*this, object, depth, parsed)) {
+              return false;
+            }
+            handled = true;
+            break;
+          }
+        }
+      }
+      if (!handled) {
+        skip_current();
+      }
       continue;
     }
     consume_peeked();
@@ -2041,6 +2709,8 @@ class Serializer {
       escape<true>(out_, v);
     } else if constexpr (XmlEnum<V>) {
       escape<true>(out_, detail::enum_to_string(v));
+    } else if constexpr (XmlCustomValue<V>) {
+      XmlValueTraits<V>::format(out_, v);  // contract: emits XML-safe text
     } else {
       append_arithmetic(out_, v);
     }
@@ -2057,6 +2727,8 @@ class Serializer {
       escape<false>(out_, v);
     } else if constexpr (XmlEnum<V>) {
       escape<false>(out_, detail::enum_to_string(v));
+    } else if constexpr (XmlCustomValue<V>) {
+      XmlValueTraits<V>::format(out_, v);  // contract: emits XML-safe text
     } else {
       append_arithmetic(out_, v);
     }
@@ -2093,6 +2765,16 @@ class Serializer {
     (..., write_attr_if<T, I>(obj));
   }
 
+  // Writes the active alternative of a variant under its bound element name.
+  template <typename FieldT, typename Var>
+  void write_variant_active(const FieldT& f, const Var& var, int depth) {
+    [&]<size_t... J>(std::index_sequence<J...>) {
+      (..., (var.index() == J
+                 ? write_field_value(f.names[J], std::get<J>(var), depth)
+                 : void()));
+    }(std::make_index_sequence<std::variant_size_v<Var>>{});
+  }
+
   template <typename T, size_t I>
   void write_child(const T& obj, int depth) {
     constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
@@ -2100,6 +2782,15 @@ class Serializer {
       // written on opening tag
     } else if constexpr (f.kind == FieldKind::Value) {
       // emitted inline by write_element, not as a child
+    } else if constexpr (f.kind == FieldKind::Variant) {
+      using M = std::decay_t<decltype(obj.*(f.member))>;
+      if constexpr (detail::is_variant<M>::value) {
+        write_variant_active(f, obj.*(f.member), depth);
+      } else {
+        for (const auto& item : obj.*(f.member)) {
+          write_variant_active(f, item, depth);
+        }
+      }
     } else if constexpr (f.kind == FieldKind::Container) {
       using M = std::decay_t<decltype(obj.*(f.member))>;
       if constexpr (XmlFixedContainer<M>) {
@@ -2143,6 +2834,8 @@ class Serializer {
         escape<false>(out_, v);
       } else if constexpr (XmlEnum<M>) {
         escape<false>(out_, detail::enum_to_string(v));
+      } else if constexpr (XmlCustomValue<M>) {
+        XmlValueTraits<M>::format(out_, v);  // contract: emits XML-safe text
       } else {
         append_arithmetic(out_, v);
       }
@@ -2150,7 +2843,8 @@ class Serializer {
       out_ += tag;
       out_ += '>';
       do_newline();
-    } else if constexpr (detail::has_element_fields<T>()) {
+    } else if constexpr (detail::has_element_fields<T>() ||
+                         detail::has_variant_fields<T>()) {
       out_ += '>';
       do_newline();
       write_children<T>(obj, depth + 1, Seq{});

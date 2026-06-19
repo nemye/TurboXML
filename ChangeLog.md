@@ -17,6 +17,15 @@ conformance test suite (`test/test_Conformance.cc`).
   `<price currency="USD">9.99</price>`).
 - `std::unique_ptr<T>` element members: an optional, possibly recursive child;
   null when absent, allocated when present, omitted on serialization when null.
+- Variant fields via `xml::variant_field` / `required_variant_field` and
+  `xml::alt<T>("name")`: maps `xs:choice` to a `std::variant<...>` member (or a
+  `std::vector<std::variant<...>>` for a repeated/interleaved choice). The matched
+  element selects the alternative; the serializer emits the active one.
+- Built-in date/time value types `xml::Date`, `xml::Time`, `xml::DateTime` (XSD
+  `date`/`time`/`dateTime`, with timezone and fractional seconds), each with
+  `std::chrono` accessors; malformed input reports `InvalidValue`.
+- `xml::XmlValueTraits<T>` customization point: parse/format any leaf type to and
+  from its XML text form (the date types are built-in specializations).
 
 ### Changed
 - Required-field presence is tracked in a multiword mask instead of a single

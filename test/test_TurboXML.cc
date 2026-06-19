@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include "Helpers.hh"
@@ -2446,4 +2448,130 @@ TEST_F(TurboBasicTests, MoreThan64FieldsMissingRequiredSecondWord) {
   Wide72 w;
   EXPECT_FALSE(xml::deserialize(p, "Wide72", w));
   EXPECT_EQ(p.error_code(), xml::ErrorCode::MissingRequiredField);
+}
+
+// Date/time value types and variant (xs:choice) fields.
+// ---- Date / Time / DateTime (XmlValueTraits leaf types) ----
+struct Event {
+  xml::Date day;        // attribute
+  xml::DateTime stamp;  // element
+  xml::Time at;         // element
+};
+template <>
+struct xml::XmlMetadata<Event> {
+  static constexpr auto fields = std::make_tuple(
+      xml::attr_field("day", &Event::day), xml::field("stamp", &Event::stamp),
+      xml::field("at", &Event::at));
+};
+
+TEST_F(TurboBasicTests, DateTimeRoundTripAndChrono) {
+  constexpr std::string_view src =
+      R"(<Event day="2026-06-18"><stamp>2026-06-18T09:30:00Z</stamp>)"
+      R"(<at>23:59:59.5+02:00</at></Event>)";
+  xml::Parser p{src};
+  Event e;
+  ASSERT_TRUE(xml::deserialize(p, "Event", e));
+  EXPECT_EQ(e.day, (xml::Date{2026, 6, 18, false, 0}));
+  EXPECT_EQ(e.stamp.time.hour, 9u);
+  EXPECT_TRUE(e.stamp.time.has_tz);
+  EXPECT_EQ(e.at.nanosecond, 500000000u);
+  EXPECT_EQ(e.at.tz_offset_min, 120);
+  // chrono accessors
+  EXPECT_EQ(e.day.to_sys_days(),
+            std::chrono::sys_days{std::chrono::year{2026} / 6 / 18});
+  EXPECT_EQ(e.stamp.to_sys_time(),  // UTC instant
+            std::chrono::sys_days{std::chrono::year{2026} / 6 / 18} +
+                std::chrono::hours{9} + std::chrono::minutes{30});
+  EXPECT_EQ(xml::serialize<false>("Event", e), src);
+}
+
+TEST_F(TurboBasicTests, DateTimeInvalidValue) {
+  // Month 13 in an element is a hard parse failure.
+  constexpr std::string_view src =
+      R"(<Event day="2026-06-18"><stamp>2026-13-01T00:00:00</stamp>)"
+      R"(<at>00:00:00</at></Event>)";
+  xml::Parser p{src};
+  Event e;
+  EXPECT_FALSE(xml::deserialize(p, "Event", e));
+  EXPECT_EQ(p.error_code(), xml::ErrorCode::InvalidValue);
+}
+
+// ---- Variant (xs:choice) ----
+struct VCircle {
+  int r{};
+};
+template <>
+struct xml::XmlMetadata<VCircle> {
+  static constexpr auto fields =
+      std::make_tuple(xml::attr_field("r", &VCircle::r));
+};
+struct VSquare {
+  int s{};
+};
+template <>
+struct xml::XmlMetadata<VSquare> {
+  static constexpr auto fields =
+      std::make_tuple(xml::attr_field("s", &VSquare::s));
+};
+
+struct Shape {
+  std::variant<VCircle, VSquare> kind;
+};
+template <>
+struct xml::XmlMetadata<Shape> {
+  static constexpr auto fields = std::make_tuple(xml::required_variant_field(
+      &Shape::kind, xml::alt<VCircle>("circle"), xml::alt<VSquare>("square")));
+};
+
+TEST_F(TurboBasicTests, VariantSingleBothBranches) {
+  {
+    constexpr std::string_view src = R"(<Shape><square s="7"/></Shape>)";
+    xml::Parser p{src};
+    Shape sh;
+    ASSERT_TRUE(xml::deserialize(p, "Shape", sh));
+    ASSERT_EQ(sh.kind.index(), 1u);
+    EXPECT_EQ(std::get<VSquare>(sh.kind).s, 7);
+    EXPECT_EQ(xml::serialize<false>("Shape", sh), src);
+  }
+  {
+    constexpr std::string_view src = R"(<Shape><circle r="3"/></Shape>)";
+    xml::Parser p{src};
+    Shape sh;
+    ASSERT_TRUE(xml::deserialize(p, "Shape", sh));
+    ASSERT_EQ(sh.kind.index(), 0u);
+    EXPECT_EQ(std::get<VCircle>(sh.kind).r, 3);
+    EXPECT_EQ(xml::serialize<false>("Shape", sh), src);
+  }
+}
+
+TEST_F(TurboBasicTests, VariantRequiredMissing) {
+  constexpr std::string_view src = R"(<Shape><triangle/></Shape>)";
+  xml::Parser p{src};
+  Shape sh;
+  EXPECT_FALSE(xml::deserialize(p, "Shape", sh));
+  EXPECT_EQ(p.error_code(), xml::ErrorCode::MissingRequiredField);
+}
+
+struct VDoc {
+  std::vector<std::variant<VCircle, VSquare>> body;
+};
+template <>
+struct xml::XmlMetadata<VDoc> {
+  static constexpr auto fields = std::make_tuple(xml::variant_field(
+      &VDoc::body, xml::alt<VCircle>("circle"), xml::alt<VSquare>("square")));
+};
+
+TEST_F(TurboBasicTests, VariantRepeatedInterleaved) {
+  constexpr std::string_view src =
+      R"(<VDoc><circle r="1"/><square s="2"/><circle r="3"/></VDoc>)";
+  xml::Parser p{src};
+  VDoc d;
+  ASSERT_TRUE(xml::deserialize(p, "VDoc", d));
+  ASSERT_EQ(d.body.size(), 3u);
+  EXPECT_EQ(d.body[0].index(), 0u);
+  EXPECT_EQ(std::get<VCircle>(d.body[0]).r, 1);
+  EXPECT_EQ(d.body[1].index(), 1u);
+  EXPECT_EQ(std::get<VSquare>(d.body[1]).s, 2);
+  EXPECT_EQ(std::get<VCircle>(d.body[2]).r, 3);
+  EXPECT_EQ(xml::serialize<false>("VDoc", d), src);
 }
