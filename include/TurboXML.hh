@@ -1086,30 +1086,8 @@ constexpr auto variant_matcher_count() noexcept -> size_t {
   return n;
 }
 
-/// @brief Flat (field_index, alt_index) pairs over every variant alternative,
-/// in declaration order then alternative order. Drives both the matcher table
-/// and the handler table so they stay aligned.
-template <typename T>
-constexpr auto variant_pairs() noexcept {
-  std::array<std::pair<size_t, size_t>, variant_matcher_count<T>()> out{};
-  size_t w = 0;
-  [&]<size_t... I>(std::index_sequence<I...>) {
-    (
-        [&] {
-          constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
-          if constexpr (f.kind == FieldKind::Variant) {
-            for (size_t a = 0; a < f.names.size(); ++a) {
-              out[w++] = {I, a};
-            }
-          }
-        }(),
-        ...);
-  }(field_seq<T>);
-  return out;
-}
-
-/// @brief Matcher table aligned with variant_pairs(): one entry per
-/// alternative.
+/// @brief One matcher per variant alternative, in declaration then alternative
+/// order. Indexes the handler table built by build_variant_dispatch.
 template <typename T>
 constexpr auto make_variant_matchers() noexcept {
   std::array<VariantMatcher, variant_matcher_count<T>()> out{};
@@ -1468,9 +1446,6 @@ class BasicParser {
   [[nodiscard]] auto peek() -> const Token*;
 
   template <typename T>
-  [[nodiscard]] auto value(std::string_view expected_name, T& out) -> bool;
-
-  template <typename T>
   [[nodiscard]] auto attr(FieldHash hash, T& out, size_t& pos) -> bool;
 
   [[nodiscard]] auto begin_element(std::string_view expected_name) -> bool;
@@ -1574,10 +1549,8 @@ class BasicParser {
     return false;
   }
 
-  // Assigns a single text run to a string-like field. When normalization is on
-  // and the target owns its bytes (std::string), expand references and
-  // normalize line endings; otherwise assign the raw view (zero-copy for
-  // std::string_view). Compiled away to a plain assignment for BasicParser<>.
+  // Assigns one text run to a string field: normalized into an owning
+  // std::string under NormalizingParser, else the raw zero-copy view.
   template <typename T>
   auto assign_value(T& out, std::string_view text) -> bool {
     if constexpr (kNormalize && std::same_as<T, std::string>) {
@@ -1613,13 +1586,26 @@ class BasicParser {
     }
   }
 
-  // Captures the enclosing element's own character data into a value_field
-  // member (XSD simpleContent), then leaves the closing tag peeked but
-  // unconsumed -- the same state pull() returns in normally, so read_element's
-  // end_element() handles it. Mirrors the scalar handling of value(): strings
-  // (raw or normalized), numbers and enums all route through the same paths.
-  template <typename M>
-  auto capture_value(M& out) -> bool {
+  // Validates and consumes a read_chardata closing tag. ConsumeClose drives the
+  // two callers: value() consumes + name-checks the close; the value_field path
+  // leaves it peeked for read_element's end_element().
+  template <bool ConsumeClose>
+  auto finish_chardata(const Token& close, std::string_view expected_name)
+      -> bool {
+    if constexpr (ConsumeClose) {
+      if (close.name != expected_name) {
+        return fail(ErrorCode::ElementMismatch);
+      }
+      consume_peeked();
+    }
+    return true;
+  }
+
+  // Reads an element's character data into a leaf member: normalized into an
+  // owning std::string, the raw last run into a string_view, or parsed for a
+  // numeric/enum/custom value. Stops at the close tag (see finish_chardata).
+  template <bool ConsumeClose, typename M>
+  auto read_chardata(M& out, std::string_view expected_name) -> bool {
     if constexpr (kNormalize && std::same_as<M, std::string>) {
       out.clear();
       while (const Token* tok = peek()) {
@@ -1634,7 +1620,7 @@ class BasicParser {
           detail::append_normalized(out, tok->data, detail::NormMode::CData);
           consume_peeked();
         } else if (tok->type == TokenType::ElementClose) {
-          return true;
+          return finish_chardata<ConsumeClose>(*tok, expected_name);
         } else if (tok->type == TokenType::Error) {
           return false;
         } else {
@@ -1643,13 +1629,15 @@ class BasicParser {
       }
       return fail(ErrorCode::UnexpectedEof);
     } else {
-      // Raw string/view, or a numeric/enum to parse: take the last text run.
       std::string_view text;
       while (const Token* tok = peek()) {
         if (tok->type == TokenType::Text || tok->type == TokenType::CData) {
           text = tok->data;
           consume_peeked();
         } else if (tok->type == TokenType::ElementClose) {
+          if (!finish_chardata<ConsumeClose>(*tok, expected_name)) {
+            return false;
+          }
           if constexpr (XmlStringLike<M>) {
             out = text;
             return true;
@@ -1675,7 +1663,7 @@ class BasicParser {
   /// @return true if `error_code_` is not `ErrorCode::None`.
   auto error() const noexcept -> bool { return error_code_ != ErrorCode::None; }
 
-  // Shared logic: record self-closing state after consuming an ElementOpen.
+  // Record self-closing state after consuming an ElementOpen.
   void update_self_closing() noexcept {
     if (current_token_.type == TokenType::ElementOpen) {
       last_self_closing_ = current_token_.self_closing;
@@ -1769,10 +1757,8 @@ class BasicParser {
   }
 
   // Comment ::= '<!--' ((Char - '-') | ('-' (Char - '-')))* '-->'
-  // The well-formedness rule forbids "--" anywhere in the content, so the first
-  // "--" we encounter must be the start of the "-->" terminator; any other "--"
-  // is a fatal error. This is a single std::find-driven pass (no slower than
-  // the generic scan it replaces) that additionally enforces the WFC.
+  // The WFC forbids "--" in content, so the first "--" must begin the "-->"
+  // terminator; any other "--" is a fatal error.
   auto parse_comment(Token& token) -> bool {
     token.type = TokenType::Comment;
     const char* start = cur_;
@@ -1878,11 +1864,9 @@ class BasicParser {
     constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
     if constexpr (f.kind == FieldKind::Attr || f.kind == FieldKind::Value ||
                   f.kind == FieldKind::Variant) {
-      // Attr fields are handled before the element loop; value fields carry the
-      // element's own text; variant fields match via the variant tables. None
-      // is matched as a child element by its own name, so this handler is never
-      // invoked for them at runtime -- it exists only because the field-indexed
-      // dispatch table is built over all indices.
+      // Attr/value/variant fields aren't matched as child elements, so this arm
+      // is unreachable; it only has to compile (the dispatch table spans every
+      // field index).
       p.skip_element();
       return true;
     } else if constexpr (f.kind == FieldKind::Container) {
@@ -1969,9 +1953,9 @@ class BasicParser {
       std::index_sequence<K...>) noexcept {
     using Handler =
         bool (*)(BasicParser&, T&, uint16_t, detail::RequiredMaskT<T>&);
-    constexpr auto pairs = detail::variant_pairs<T>();
+    constexpr auto m = detail::make_variant_matchers<T>();
     return std::array<Handler, sizeof...(K)>{
-        &read_variant<T, pairs[K].first, pairs[K].second>...};
+        &read_variant<T, m[K].field_index, m[K].alt_index>...};
   }
 
   template <typename T, size_t... I>
@@ -2238,54 +2222,6 @@ inline auto BasicParser<Opts>::parse_numeric(std::string_view text,
   }
 }
 
-template <ParserOptions Opts>
-template <typename T>
-inline auto BasicParser<Opts>::value(std::string_view expected_name, T& out)
-    -> bool {
-  if constexpr (XmlStringLike<T>) {
-    if constexpr (kNormalize && std::same_as<T, std::string>) {
-      // Owning target + normalization: accumulate every character-data run
-      // (Text + CDATA) between the tags, expanding references in Text and
-      // copying CDATA literally (EOL-normalized, never reference-expanded).
-      out.clear();
-      while (const Token* token = next()) {
-        if (token->type == TokenType::Text) {
-          if (const ErrorCode ec = detail::append_normalized(
-                  out, token->data, detail::NormMode::Text);
-              ec != ErrorCode::None) {
-            return fail(ec);
-          }
-        } else if (token->type == TokenType::CData) {
-          detail::append_normalized(out, token->data, detail::NormMode::CData);
-        } else if (token->type == TokenType::ElementClose) {
-          return token->name == expected_name
-                     ? true
-                     : fail(ErrorCode::ElementMismatch);
-        }
-      }
-      return fail(ErrorCode::UnexpectedEof);
-    } else {
-      while (const Token* token = next()) {
-        if (token->type == TokenType::Text) {
-          out = token->data;
-        }
-        if (token->type == TokenType::ElementClose) {
-          return token->name == expected_name
-                     ? true
-                     : fail(ErrorCode::ElementMismatch);
-        }
-      }
-      return fail(ErrorCode::UnexpectedEof);  // next() set a code, or true EOF
-    }
-  } else {
-    std::string_view text;
-    if (!value(expected_name, text)) {
-      return false;  // string pass already recorded the cause
-    }
-    return parse_scalar(text, out) ? true : fail(scalar_error<T>());
-  }
-}
-
 // Document-order fast path: attribute fields are typically declared in the
 // same order the attributes appear, so try the cursor position first and
 // fall back to a full first-match scan on miss.
@@ -2462,8 +2398,7 @@ inline void BasicParser<Opts>::skip_element() {
   }
 }
 
-// Opening tag already consumed by caller (handle_element, try_begin_element,
-// or consume_peeked in the N==1 inline path).
+// Opening tag already consumed by the caller.
 template <ParserOptions Opts>
 template <typename T>
 inline auto BasicParser<Opts>::read_element(std::string_view expected_name,
@@ -2510,7 +2445,7 @@ inline auto BasicParser<Opts>::read_element(std::string_view expected_name,
         return parse_scalar(text, out) ? true : fail(scalar_error<T>());
       }
     }
-    return value<T>(expected_name, out);
+    return read_chardata<true>(out, expected_name);
   } else {
     bool result = false;
     if constexpr (XmlObject<T>) {
@@ -2589,7 +2524,7 @@ inline auto BasicParser<Opts>::pull(T& object, const uint16_t depth) -> bool {
         return fail(scalar_error<M>());  // empty number/enum is invalid
       }
     } else {
-      if (!capture_value(object.*(vf.member))) {
+      if (!read_chardata<false>(object.*(vf.member), {})) {
         return false;
       }
       if constexpr (XmlStringLike<M>) {
@@ -2758,20 +2693,27 @@ class Serializer {
     }
   }
 
+  // Appends a scalar's text form. Attr selects attribute- vs content-escaping;
+  // custom-value traits must emit XML-safe text.
+  template <bool Attr, typename V>
+  void write_scalar(const V& v) {
+    if constexpr (XmlStringLike<V>) {
+      escape<Attr>(out_, v);
+    } else if constexpr (XmlEnum<V>) {
+      escape<Attr>(out_, detail::enum_to_string(v));
+    } else if constexpr (XmlCustomValue<V>) {
+      XmlValueTraits<V>::format(out_, v);
+    } else {
+      append_arithmetic(out_, v);
+    }
+  }
+
   template <typename V>
   void write_attr_value(std::string_view name, const V& v) {
     out_ += ' ';
     out_ += name;
     out_ += "=\"";
-    if constexpr (XmlStringLike<V>) {
-      escape<true>(out_, v);
-    } else if constexpr (XmlEnum<V>) {
-      escape<true>(out_, detail::enum_to_string(v));
-    } else if constexpr (XmlCustomValue<V>) {
-      XmlValueTraits<V>::format(out_, v);  // contract: emits XML-safe text
-    } else {
-      append_arithmetic(out_, v);
-    }
+    write_scalar<true>(v);
     out_ += '"';
   }
 
@@ -2781,15 +2723,7 @@ class Serializer {
     out_ += '<';
     out_ += tag;
     out_ += '>';
-    if constexpr (XmlStringLike<V>) {
-      escape<false>(out_, v);
-    } else if constexpr (XmlEnum<V>) {
-      escape<false>(out_, detail::enum_to_string(v));
-    } else if constexpr (XmlCustomValue<V>) {
-      XmlValueTraits<V>::format(out_, v);  // contract: emits XML-safe text
-    } else {
-      append_arithmetic(out_, v);
-    }
+    write_scalar<false>(v);
     out_ += "</";
     out_ += tag;
     out_ += '>';
@@ -2896,18 +2830,8 @@ class Serializer {
       // simpleContent: <tag attrs>text</tag> on a single line.
       constexpr size_t VI = detail::value_field_index<T>();
       constexpr auto& vf = std::get<VI>(XmlMetadata<T>::fields);
-      using M = std::decay_t<decltype(obj.*(vf.member))>;
-      const auto& v = obj.*(vf.member);
       out_ += '>';
-      if constexpr (XmlStringLike<M>) {
-        escape<false>(out_, v);
-      } else if constexpr (XmlEnum<M>) {
-        escape<false>(out_, detail::enum_to_string(v));
-      } else if constexpr (XmlCustomValue<M>) {
-        XmlValueTraits<M>::format(out_, v);  // contract: emits XML-safe text
-      } else {
-        append_arithmetic(out_, v);
-      }
+      write_scalar<false>(obj.*(vf.member));
       out_ += "</";
       out_ += tag;
       out_ += '>';

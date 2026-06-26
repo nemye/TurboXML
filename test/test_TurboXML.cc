@@ -991,8 +991,8 @@ TEST_F(TurboBasicTests, DeepNestingWithUnknownSiblings) {
 // ---- AttrField / element-name collision ----
 
 /// @brief A child element whose name matches an AttrField hash must be
-/// skipped without disrupting the parse. This exercises the FieldKind::Attr
-/// branch in handle_element / inline dispatch.
+/// skipped without disrupting the parse (exercises the FieldKind::Attr dispatch
+/// arm).
 TEST_F(TurboBasicTests, ElementNameCollidesWithAttrField) {
   constexpr std::string_view xml_src = R"(
 <Users>

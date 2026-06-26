@@ -6,6 +6,11 @@ XML 1.0 well-formedness conformance pass. Adds an XML 1.0 (Fifth Edition)
 conformance test suite (`test/test_Conformance.cc`).
 
 ### Added
+- `xsdgen` tool (`tools/`): generates `XmlMetadata` definitions from an XSD
+  schema (parsed with TurboXML itself). Maps complexTypes/elements/attributes,
+  enumerations, simpleContent, `xs:choice`, built-ins (incl. date/time), and
+  recursion to the library's features; unsupported constructs are reported as
+  notes. Built behind `TURBOXML_BUILD_CODEGEN` (on by default).
 - `xml::ErrorCode` enum and `Parser::error_code()`: a failed `deserialize()`
   now reports a specific reason (e.g. `UnterminatedComment`, `ElementMismatch`,
   `RootElementNotFound`). `reset()` clears it.

@@ -372,6 +372,26 @@ xml::deserialize(p, "root", obj);   // rejects ill-formed input; also normalizes
 
 These checks each add a scan to the hot path, so they are **opt-in**: the default `xml::Parser` compiles them away entirely (zero cost). Parser policy is selected via the `xml::ParserOptions` flags (`normalize`, `strict`); the `Parser` / `NormalizingParser` / `StrictParser` aliases cover the common combinations, or use `xml::BasicParser<ParserOptions{...}>` directly.
 
+## Generating from XSD
+
+The `xsdgen` tool turns an XSD schema into the matching `XmlMetadata` definitions,
+so you don't hand-write the mapping. The schema is parsed with TurboXML itself.
+
+```bash
+./build/turboxml_xsdgen schema.xsd -o schema_generated.hh   # stdout if no -o
+```
+
+It maps `xs:complexType`→`struct`, `xs:element`/`xs:attribute`→`field`/`attr_field`
+(by `minOccurs`/`maxOccurs`/`use`: `std::vector` for repeats, `std::optional` for
+`minOccurs="0"`, `required` otherwise), `xs:simpleType` enumerations→`enum` +
+`XmlEnumTraits`, `simpleContent`→`value_field`, `xs:choice`→`std::variant` +
+`variant_field`, built-ins to `std::string`/`int`/`double`/`bool`/`xml::Date`…,
+and recursive types through `std::vector`/`std::unique_ptr`. It targets a
+practical subset; anything outside it (e.g. `complexContent` inheritance,
+`xs:group`, `xs:any`, mixed content, multiple namespaces) is reported as a
+`// UNSUPPORTED:` note in the output and on stderr rather than failing. Built with
+`TURBOXML_BUILD_CODEGEN` (on by default).
+
 ## Building
 
 ### Requirements
@@ -397,6 +417,7 @@ Copy `include/TurboXML.hh` into your project. No build step required.
 |---|---|---|
 | `TURBOXML_BUILD_TESTS` | `ON` | Build unit tests (fetches GTest if not found) |
 | `TURBOXML_BUILD_BENCHMARKS` | `ON` | Build benchmarks (fetches Google Benchmark if not found) |
+| `TURBOXML_BUILD_CODEGEN` | `ON` | Build the `xsdgen` XSD → `XmlMetadata` code generator |
 | `TURBOXML_WITH_PUGIXML` | `OFF` | Build pugixml comparison benchmarks (fetches pugixml if not found) |
 | `TURBOXML_WITH_RAPIDXML` | `OFF` | Build RapidXML comparison benchmarks (fetches Boost, uses its bundled RapidXML) |
 | `TURBOXML_WITH_LIBXML2` | `OFF` | Build libxml2 comparison benchmarks (fetches libxml2 if not found) |
@@ -418,10 +439,15 @@ target_link_libraries(my_target PRIVATE TurboXML::turboxml)
 ├── clean.sh
 ├── include/
 │   └── TurboXML.hh
+├── tools/
+│   ├── XsdCodegen.hh        # XSD -> XmlMetadata generator (library)
+│   └── xsdgen.cc            # CLI front-end
 ├── test/
 │   ├── bench_TurboXML.cc
 │   ├── Helpers.hh
-│   └── test_TurboXML.cc
+│   ├── test_TurboXML.cc
+│   ├── test_XsdCodegen.cc
+│   └── xsd_sample.xsd       # + xsd_sample_generated.hh golden
 ```
 
 ## License

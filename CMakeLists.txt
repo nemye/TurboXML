@@ -13,6 +13,7 @@ message(STATUS "TurboXML: Build Type = ${CMAKE_BUILD_TYPE}.")
 # ---- Options ----
 option(TURBOXML_BUILD_TESTS       "Build unit tests (requires GTest)"                      ON)
 option(TURBOXML_BUILD_BENCHMARKS  "Build benchmarks (requires Google Benchmark)"           ON)
+option(TURBOXML_BUILD_CODEGEN     "Build the XSD -> XmlMetadata code generator (xsdgen)"   ON)
 option(TURBOXML_WITH_PUGIXML      "Build pugixml comparison benchmarks"                    OFF)
 option(TURBOXML_WITH_RAPIDXML     "Build RapidXML comparison benchmarks (via Boost)"       OFF)
 option(TURBOXML_WITH_LIBXML2      "Build libxml2 comparison benchmarks"                    OFF)
@@ -73,6 +74,13 @@ if(TURBOXML_BUILD_TESTS)
     add_executable(turboxml_tests
         test/test_TurboXML.cc
         test/test_Conformance.cc
+        test/test_XsdCodegen.cc
+    )
+    target_include_directories(turboxml_tests PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools
+    )
+    target_compile_definitions(turboxml_tests PRIVATE
+        TXSD_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test"
     )
     target_link_libraries(turboxml_tests PRIVATE
         turboxml_helpers
@@ -167,9 +175,22 @@ if(TURBOXML_BUILD_BENCHMARKS)
     message(STATUS "TurboXML: benchmarks enabled")
 endif()
 
+# ---- XSD code generator ----
+if(TURBOXML_BUILD_CODEGEN)
+    add_executable(turboxml_xsdgen tools/xsdgen.cc)
+    target_link_libraries(turboxml_xsdgen PRIVATE turboxml)
+    target_include_directories(turboxml_xsdgen PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tools
+    )
+    target_compile_options(turboxml_xsdgen PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
+    )
+    message(STATUS "TurboXML: XSD code generator enabled")
+endif()
+
 # Installation
 set(INSTALL_DIR "${CMAKE_SOURCE_DIR}/bin")
-foreach(_target turboxml_tests turboxml_bench)
+foreach(_target turboxml_tests turboxml_bench turboxml_xsdgen)
     if(TARGET ${_target})
         install(TARGETS ${_target} DESTINATION ${INSTALL_DIR})
     endif()
