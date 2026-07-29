@@ -813,6 +813,50 @@ TEST_F(LightningBasicTests, ElementNameCollidesWithAttrField) {
   EXPECT_EQ(users.items[0].email, "c@c.com");
 }
 
+/// @brief Field dispatch must confirm the name after the hash matches.
+///
+/// allNamesUnique<T>() only proves the declared names do not alias each other;
+/// it says nothing about a document name colliding with a declared one. FNV-1a
+/// is invertible, so such a collision is constructible rather than improbable,
+/// and binding on the hash alone would let a chosen name reach a field it does
+/// not name. Constructing a real 64-bit collision does not belong in a unit
+/// test, so the guard is driven directly with the hash of a declared field
+/// paired with a name that is not it - exactly the state a collision produces.
+TEST_F(LightningBasicTests, FieldDispatchVerifiesNameAfterHashMatch) {
+  constexpr size_t no_match = xmlight::detail::FIELD_COUNT<User>;
+  constexpr xmlight::FieldHash name_hash = xmlight::detail::hashFieldName("Name");
+
+  EXPECT_LT(xmlight::detail::findFieldIndex<User>(name_hash, "Name"), no_match);
+  EXPECT_EQ(xmlight::detail::findFieldIndex<User>(name_hash, "Collider"), no_match);
+  // A prefix of the real name must not slip through either.
+  EXPECT_EQ(xmlight::detail::findFieldIndex<User>(name_hash, "Nam"), no_match);
+}
+
+/// @brief The attribute path applies the same post-hash name check. Its
+/// rejection branch needs a real hash collision to reach, so what is pinned
+/// here is that the check does not disturb the shapes that legitimately reach
+/// it: an attribute matched out of declaration order (the full-scan arm) and a
+/// prefixed attribute, whose local name is what both the hash and the compare
+/// are taken from.
+TEST_F(LightningBasicTests, AttributeNameCheckPreservesMatching) {
+  {
+    xmlight::Parser parser{std::string_view(R"(<I s5="e" a3="3" s1="a" a1="1"/>)")};
+    AttrItem item;
+    ASSERT_TRUE(xmlight::deserialize(parser, "I", item));
+    EXPECT_EQ(item.a1, 1);
+    EXPECT_EQ(item.a3, 3);
+    EXPECT_EQ(item.s1, "a");
+    EXPECT_EQ(item.s5, "e");
+  }
+  {
+    xmlight::Parser parser{std::string_view(R"(<M ns:id="7" role="r"/>)")};
+    OrgMember member;
+    ASSERT_TRUE(xmlight::deserialize(parser, "M", member));
+    EXPECT_EQ(member.id, 7);
+    EXPECT_EQ(member.role, "r");
+  }
+}
+
 /// @brief Vectors of string primitives: empty container, multiple values, and
 /// a self-closing element yielding an empty string_view.
 TEST_F(LightningBasicTests, VecOfPrimitivesForms) {
@@ -1755,7 +1799,7 @@ TEST_F(LightningBasicTests, StrictCharDataValidationFused) {
   const std::string fourteen(14, 'a');
   const std::string fifteen(15, 'a');
   const std::string sixteen(16, 'a');
-  const auto REJECT = std::to_array<std::pair<std::string, xmlight::ErrorCode>>({
+  const auto reject = std::to_array<std::pair<std::string, xmlight::ErrorCode>>({
       // "]]" ends the first 16-byte chunk, '>' opens the next.
       {fourteen + "]]>", xmlight::ErrorCode::CDataEndInContent},
       // "]]>" split ']' / "]>" across the chunk boundary.
@@ -1768,7 +1812,7 @@ TEST_F(LightningBasicTests, StrictCharDataValidationFused) {
       // Short run: byte-loop tail only.
       {std::string("b\x01d"), xmlight::ErrorCode::ForbiddenControlChar},
   });
-  for (const auto& [text, want] : REJECT) {
+  for (const auto& [text, want] : reject) {
     const std::string xml = "<NormText><v>" + text + "</v></NormText>";
     xmlight::StrictParser p{xml};
     NormText t;
@@ -1785,13 +1829,13 @@ TEST_F(LightningBasicTests, StrictCharDataValidationFused) {
   for (int i = 0; i < 20; ++i) {
     dense += "]x";
   }
-  const auto ACCEPT = std::to_array<std::string>({
+  const auto accept = std::to_array<std::string>({
       sixteen + "]",   // ']' as the final byte after a clean chunk
       fifteen + "]]",  // "]]" with no '>' at the very end
       dense,           // ']'-dense long run: one containsCdataEnd resolution
       "a\tb\nc",       // legal whitespace controls
   });
-  for (const auto& text : ACCEPT) {
+  for (const auto& text : accept) {
     const std::string xml = "<NormText><v>" + text + "</v></NormText>";
     xmlight::StrictParser p{xml};
     NormText t;
@@ -2684,6 +2728,29 @@ TEST_F(LightningBasicTests, SerializerEscaping) {
                        R"("><Name>)" + std::string(40, 'A') + "&lt;mid&gt;" + std::string(40, 'B') +
                        "</Name></U>");
   }
+}
+
+/// Whitespace inside a string field must survive serialize() -> deserialize().
+/// A conforming reader rewrites literal whitespace on the way back in
+/// (attribute-value normalization folds tab/LF/CR to a space, EOL
+/// normalization folds CR to LF), so the serializer has to emit it as numeric
+/// character references or the bytes are silently lost on the round trip.
+TEST_F(LightningBasicTests, SerializerEscapesWhitespaceForRoundTrip) {
+  OwnedUser user;
+  user.id = 7;
+  user.role = "a\tb\nc\rd";
+  user.name = "e\tf\ng\rh";
+  const std::string xml = xmlight::serialize<false>("U", user);
+
+  EXPECT_NE(xml.find(R"(role="a&#9;b&#10;c&#13;d")"), std::string::npos);
+  // Tab and LF are preserved literally in content; only CR is normalized away.
+  EXPECT_NE(xml.find("<Name>e\tf\ng&#13;h</Name>"), std::string::npos);
+
+  xmlight::StrictParser parser{xml};
+  OwnedUser out;
+  ASSERT_TRUE(xmlight::deserialize(parser, "U", out));
+  EXPECT_EQ(out.role, user.role);
+  EXPECT_EQ(out.name, user.name);
 }
 
 TEST_F(LightningBasicTests, SerializerLongTagNameRoundTrip) {

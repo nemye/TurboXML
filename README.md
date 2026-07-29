@@ -381,6 +381,30 @@ xmlight::deserialize(p, "root", obj);   // rejects ill-formed input; also normal
 
 These checks each add a scan to the hot path, so they are **opt-in**: the default `xmlight::Parser` compiles them away entirely (zero cost). Parser policy is selected via the `xmlight::ParserOptions` flags (`normalize`, `strict`); the `Parser` / `NormalizingParser` / `StrictParser` aliases cover the common combinations, or use `xmlight::BasicParser<ParserOptions{...}>` directly.
 
+### Limitations
+
+Deliberate scope boundaries, listed so they are not mistaken for defects. These
+apply to every parser mode, strict included.
+
+**Encoding.** The parser reads UTF-8 only. A UTF-8 BOM is consumed; a UTF-16 or
+UTF-32 BOM, a BOM-less UTF-16 start, or an XML declaration naming any encoding
+other than UTF-8 / US-ASCII is rejected with `ErrorCode::UnsupportedEncoding`
+rather than scanned as bytes. What is *not* checked is whether the source is
+well-formed UTF-8: character references are validated against the `Char`
+production and strict mode rejects forbidden control bytes, but an invalid
+multi-byte sequence in the input passes through into a `std::string` field
+unexamined. Validate untrusted input before parsing if that matters to you.
+
+**Namespaces.** Prefixes are parsed and split, but never resolved — no `xmlns`
+binding is tracked. Field matching, and the start/end tag match, use the local
+name alone. So two elements with the same local name in different namespaces
+bind to the same field, and `<a:x>…</b:x>` is accepted. `Token::prefix` and
+`Attribute::prefix` carry the raw prefix if you need to inspect it yourself.
+
+**DTDs.** `DOCTYPE` is skipped structurally, not interpreted. There is no
+external entity resolution, and the only entities recognized are the five
+predefined ones — anything else is `ErrorCode::UndefinedEntity`.
+
 ## Generating from XSD
 
 The `xsdgen` tool turns an XSD schema into the matching `XmlMetadata` definitions,
@@ -465,9 +489,29 @@ Copy `include/LightningXML.hh` into your project. No build step required.
 | `LIGHTNINGXML_WITH_PUGIXML` | `OFF` | Build pugixml comparison benchmarks (fetches pugixml if not found) |
 | `LIGHTNINGXML_WITH_RAPIDXML` | `OFF` | Build RapidXML comparison benchmarks (fetches Boost, uses its bundled RapidXML) |
 | `LIGHTNINGXML_WITH_LIBXML2` | `OFF` | Build libxml2 comparison benchmarks (fetches libxml2 if not found) |
+| `LIGHTNINGXML_BUILD_FUZZERS` | `OFF` | Build the libFuzzer target (requires Clang) |
 | `LIGHTNINGXML_ENABLE_SANITIZERS` | `OFF` | Enable AddressSanitizer and UndefinedBehaviorSanitizer |
+| `LIGHTNINGXML_ENABLE_COVERAGE` | `OFF` | Enable gcov coverage instrumentation (forces unity and LTO off) |
 | `LIGHTNINGXML_ENABLE_UNITY_BUILD` | `ON` | Compile executables as unity builds |
 | `LIGHTNINGXML_ENABLE_LTO` | `ON` | Enable link-time optimization (IPO) for executables |
+
+### Fuzzing
+
+```bash
+cmake -S . -B build-fuzz -DCMAKE_CXX_COMPILER=clang++ -DLIGHTNINGXML_BUILD_FUZZERS=ON
+cmake --build build-fuzz
+mkdir -p /tmp/lightningxml-corpus
+./build-fuzz/lightningxml_fuzz -max_len=65536 /tmp/lightningxml-corpus test/fuzz_corpus
+```
+
+The target runs each input through all three parser modes and checks that
+re-serializing a parsed document reproduces it exactly, so escaping and
+normalization regressions surface as crashes rather than silent data loss.
+
+`test/fuzz_corpus` holds hand-written seeds only. Pass a scratch directory
+**first**, as above: libFuzzer writes newly discovered inputs to the first
+corpus directory and treats the rest as read-only, so naming the seed
+directory alone would fill it with generated units.
 
 
 ### As a CMake Subdirectory
@@ -503,6 +547,11 @@ target_link_libraries(my_target PRIVATE LightningXML::lightningxml)
 │   └── XSDGen.cc            # CLI front-end
 ├── test/
 │   ├── bench_LightningXML.cc
+│   ├── fuzz_LightningXML.cc
+│   ├── fuzz_corpus/         # libFuzzer seed inputs
+│   ├── schemas/             # XSD fixtures for the codegen tests
+│   ├── test_Conformance.cc  # XML 1.0 spec-section conformance suite
+│   ├── test_Generated.cc    # compiles + round-trips the generated header
 │   ├── test_Helpers.hh
 │   ├── test_LightningXML.cc
 │   └── test_XSDCodegen.cc

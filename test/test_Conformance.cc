@@ -1062,6 +1062,79 @@ TEST_F(Sec31Tags, WFC_UniqueAttSpec) {
   EXPECT_EQ(ao.x, "first");  // document-order match wins
 }
 
+/// WFC: Unique Att Spec on a start-tag far wider than any real one.
+///
+/// Detection must stay exact once the tag outgrows the direct-scan regime and
+/// moves into the probe table, both for a duplicate at the very end (which
+/// only the table can catch) and for a tag that is merely wide and legal. The
+/// assertion here is correctness, not timing: a wall-clock bound would be
+/// flaky in CI, and the linear behavior is what keeps this test quick enough
+/// to notice if it ever regresses.
+TEST_F(Sec31Tags, WFC_UniqueAttSpecWideStartTag) {
+  constexpr int kCount = 20000;
+  std::string wide;
+  for (int i = 0; i < kCount; ++i) {
+    wide += " a" + std::to_string(i) + R"(="v")";
+  }
+
+  {
+    const std::string src = "<r" + wide + "/>";
+    xmlight::StrictParser sp{src};
+    AttrOnly ao;
+    EXPECT_TRUE(xmlight::deserialize(sp, "r", ao));
+    EXPECT_EQ(sp.errorCode(), xmlight::ErrorCode::None);
+  }
+  {
+    // The duplicate names the very first attribute, so nothing but a complete
+    // record of every name seen so far can catch it.
+    const std::string src = "<r" + wide + R"( a0="dup"/>)";
+    xmlight::StrictParser sp{src};
+    AttrOnly ao;
+    EXPECT_FALSE(xmlight::deserialize(sp, "r", ao));
+    EXPECT_EQ(sp.errorCode(), xmlight::ErrorCode::DuplicateAttribute);
+  }
+}
+
+/// Sec 4.3.3 - the parser reads UTF-8 only, so anything else must be rejected
+/// outright rather than scanned as bytes and reported as a missing root.
+TEST_F(Sec31Tags, RejectsNonUtf8Input) {
+  using namespace std::string_view_literals;  // the wide forms embed NUL bytes
+  const auto rejected = [](std::string_view src) {
+    xmlight::Parser p{src};
+    Leaf leaf;
+    return !xmlight::deserialize(p, "r", leaf) &&
+           p.errorCode() == xmlight::ErrorCode::UnsupportedEncoding;
+  };
+
+  EXPECT_TRUE(rejected("\xFF\xFE<\0r\0>\0"sv));          // UTF-16LE BOM
+  EXPECT_TRUE(rejected("\xFE\xFF\0<\0r\0>"sv));          // UTF-16BE BOM
+  EXPECT_TRUE(rejected("\xFF\xFE\0\0<\0\0\0"sv));        // UTF-32LE BOM
+  EXPECT_TRUE(rejected("\0\0\xFE\xFF\0\0\0<"sv));        // UTF-32BE BOM
+  EXPECT_TRUE(rejected("<\0r\0>\0"sv));                  // BOM-less UTF-16LE
+  EXPECT_TRUE(rejected("\0<\0r\0>"sv));                  // BOM-less UTF-16BE
+  EXPECT_TRUE(rejected(R"(<?xml version="1.0" encoding="UTF-16"?><r>x</r>)"sv));
+  EXPECT_TRUE(rejected(R"(<?xml encoding='ISO-8859-1'?><r>x</r>)"sv));
+}
+
+/// The UTF-8 spellings the declaration may legally use must all be accepted,
+/// as must a BOM, an absent declaration, and an absent encoding attribute.
+TEST_F(Sec31Tags, AcceptsUtf8Declarations) {
+  const auto accepted = [](std::string_view src) {
+    xmlight::Parser p{src};
+    Leaf leaf;
+    return xmlight::deserialize(p, "r", leaf) && leaf.text == "x";
+  };
+
+  EXPECT_TRUE(accepted("\xEF\xBB\xBF<r><v>x</v></r>"));  // UTF-8 BOM
+  EXPECT_TRUE(accepted("<r><v>x</v></r>"));
+  EXPECT_TRUE(accepted(R"(<?xml version="1.0"?><r><v>x</v></r>)"));
+  EXPECT_TRUE(accepted(R"(<?xml version="1.0" encoding="UTF-8"?><r><v>x</v></r>)"));
+  EXPECT_TRUE(accepted(R"(<?xml version="1.0" encoding="utf-8"?><r><v>x</v></r>)"));
+  EXPECT_TRUE(accepted(R"(<?xml version="1.0" encoding='US-ASCII'?><r><v>x</v></r>)"));
+  // "encoding" appearing in content must not be mistaken for a declaration.
+  EXPECT_TRUE(accepted(R"(<r><v>x</v><n>encoding="UTF-16"</n></r>)"));
+}
+
 /// Unclosed start tag - must fail.
 TEST_F(Sec31Tags, UnclosedStartTag) {
   const std::string_view src = R"(<r x="v")";
