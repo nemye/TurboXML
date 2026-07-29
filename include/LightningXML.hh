@@ -984,6 +984,102 @@ inline constexpr bool ANY_ELEM_TARGET_HAS_ATTRS = anyFieldSatisfies<T>([](const 
   }
 });
 
+/// @brief Type a child-element member parses into, unwrapped through
+/// unique_ptr/optional wrappers. The type-level analog of
+/// elementTargetHasAttrs.
+template<typename M>
+constexpr auto elementTargetType() noexcept {
+  if constexpr (IsUniquePtr<M>::value) {
+    return elementTargetType<typename M::element_type>();
+  } else if constexpr (IsOptional<M>::value) {
+    return elementTargetType<typename M::value_type>();
+  } else {
+    return std::type_identity<M>{};
+  }
+}
+template<typename M>
+using ElementTargetT = typename decltype(elementTargetType<M>())::type;
+
+/// @brief Number of attribute fields declared by T.
+template<typename T>
+constexpr auto countAttrFields() noexcept -> size_t {
+  constexpr auto kinds = makeFieldKinds<T>();
+  return static_cast<size_t>(std::ranges::count_if(kinds, isKind(FieldKind::Attr)));
+}
+template<typename T>
+inline constexpr size_t N_ATTR_FIELDS = countAttrFields<T>();
+
+/// @brief Field indices of T's attribute fields in declaration order
+/// (attribute ordinal -> field index).
+template<typename T>
+constexpr auto makeAttrOrdinals() noexcept {
+  constexpr auto kinds = makeFieldKinds<T>();
+  std::array<size_t, (N_ATTR_FIELDS<T> != 0 ? N_ATTR_FIELDS<T> : 1)> ords{};
+  size_t k = 0;
+  for (size_t i = 0; i < kinds.size(); ++i) {
+    if (kinds[i] == FieldKind::Attr) {
+      ords[k++] = i;
+    }
+  }
+  return ords;
+}
+
+/// @brief Attribute ordinal of field I (count of attribute fields before it).
+template<typename T, size_t I>
+inline constexpr size_t ATTR_ORDINAL = [] {
+  constexpr auto kinds = makeFieldKinds<T>();
+  size_t k = 0;
+  for (size_t i = 0; i < I; ++i) {
+    if (kinds[i] == FieldKind::Attr) {
+      ++k;
+    }
+  }
+  return k;
+}();
+
+/// @brief Name hashes of T's attribute fields, indexed by attribute ordinal.
+template<typename T>
+constexpr auto makeAttrHashesByOrdinal() noexcept {
+  constexpr auto ords = makeAttrOrdinals<T>();
+  constexpr auto hashes = makeFieldHashes<T>();
+  std::array<FieldHash, ords.size()> out{};
+  for (size_t k = 0; k < N_ATTR_FIELDS<T>; ++k) {
+    out[k] = hashes[ords[k]];
+  }
+  return out;
+}
+
+/// @brief "name=" byte pattern of T's K-th attribute field (by ordinal):
+/// matching it plus the following quote with one constant-length compare is
+/// the streamed-attribute fast path. The '=' terminator makes prefix
+/// collisions ("id" vs "idx") impossible.
+template<typename T, size_t K>
+inline constexpr auto ATTR_PATTERN = [] {
+  constexpr auto ords = makeAttrOrdinals<T>();
+  constexpr std::string_view name = makeFieldNames<T>()[ords[K]];
+  std::array<char, name.size() + 1> pat{};
+  for (size_t i = 0; i < name.size(); ++i) {
+    pat[i] = name[i];
+  }
+  pat[name.size()] = '=';
+  return pat;
+}();
+
+/// @brief Whether attributes of an element deserializing into E take the
+/// streamed typed capture path (single pass, no attributes_ materialization)
+/// instead of the vector + dispatch pass. Strict mode streams too: its value
+/// checks run inline per ordinal, and any list that deviates from the
+/// schema-ordered shape rewinds to parseAttributes, where the duplicate and
+/// well-formedness semantics live.
+template<typename E, bool STRICT_MODE>
+constexpr auto streamsAttrs() noexcept -> bool {
+  if constexpr (!XmlObject<E>) {
+    return false;
+  } else {
+    return HAS_ATTR_FIELDS<E> && N_ATTR_FIELDS<E> <= 32;
+  }
+}
+
 /// @brief True if any container field of T stores into a fixed container
 /// (std::array); gates the per-pull fill-counter array.
 template<typename T>
@@ -1482,7 +1578,7 @@ class BasicParser {
 
   /// @brief Constructs a parser over src. src must outlive the Parser.
   explicit BasicParser(std::string_view src) noexcept
-      : src_(src), cur_(src.data()), end_(src.data() + src.size()) {
+      : cur_(src.data()), end_(src.data() + src.size()), src_(src) {
     skipBom();
   }
 
@@ -1500,6 +1596,8 @@ class BasicParser {
     end_ = src_.data() + src_.size();
     has_peek_ = false;
     attributes_.clear();
+    attr_have_ = 0;
+    attr_streamed_ = false;
     error_code_ = ErrorCode::None;
     last_self_closing_ = false;
     skipBom();
@@ -1516,6 +1614,7 @@ class BasicParser {
   [[nodiscard]] auto attr(FieldHash hash, T& out, size_t& pos) -> bool;
 
   [[nodiscard]] auto beginElement(std::string_view expected_name) -> bool;
+  template<size_t NAME_LEN = 0>
   [[nodiscard]] auto endElement(std::string_view expected_name) -> bool;
 
   template<typename T>
@@ -1674,28 +1773,52 @@ class BasicParser {
   // (not routed through assignValue) deliberately: it needs NormMode::Attr,
   // and the extra call layer measurably regressed attribute-heavy parses.
   template<typename U>
-  auto assignAttrValue(U& out, const Attribute& a) -> bool {
+  auto assignAttrValue(U& out, std::string_view value) -> bool {
     if constexpr (XmlListContainer<U>) {
       using V = typename XmlContainerTraits<U>::value_type;
       if constexpr (NORMALIZE_LIST<V>) {
-        return splitNormalized<detail::NormMode::Attr>(out, a.value);
+        return splitNormalized<detail::NormMode::Attr>(out, value);
       } else {
-        return splitInto<false>(out, a.value);
+        return splitInto<false>(out, value);
       }
     } else if constexpr (XmlStringLike<U>) {
       if constexpr (NORMALIZE && std::same_as<U, std::string>) {
         out.clear();
-        const ErrorCode ec = detail::appendNormalized(out, a.value, detail::NormMode::Attr);
+        const ErrorCode ec = detail::appendNormalized(out, value, detail::NormMode::Attr);
         // On a bad reference, fail() records the code; the attribute reports
         // "not matched" and pull() converts the recorded error into a hard fail
         // right after attribute dispatch.
         return ec == ErrorCode::None ? true : fail(ec);
       } else {
-        out = a.value;
+        out = value;
         return true;
       }
     } else {
-      return parseScalar(a.value, out);
+      return parseScalar(value, out);
+    }
+  }
+
+  // Assigns a matched attribute's raw value to the member with the
+  // optional-temporary and error-conversion semantics of attribute matching.
+  // Shared by the vector dispatch (attr) and the streamed dispatch so both
+  // produce byte-identical normalization and error codes.
+  template<typename T>
+  auto assignAttrChecked(std::string_view value, T& out) -> bool {
+    if constexpr (XmlOptional<T>) {
+      // Parse into a temporary so a parse failure leaves the optional empty
+      typename T::value_type tmp{};
+      if (!assignAttrValue(tmp, value)) {
+        return false;
+      }
+      out = std::move(tmp);
+      return true;
+    } else {
+      // The attribute is present; a parse failure here is a malformed value
+      if (!assignAttrValue(out, value)) {
+        fail(scalarError<T>());
+        return false;
+      }
+      return true;
     }
   }
 
@@ -1772,7 +1895,7 @@ class BasicParser {
       });
     } else {
       return each_token([this, &out](std::string_view tok) {
-        return detail::readIntoNew(out, [this, tok](auto& slot) {
+        return detail::readIntoNew(out, [this, tok](typename Traits::value_type& slot) {
           return assignToken<Normalized>(slot, tok);
         });
       });
@@ -1925,6 +2048,23 @@ class BasicParser {
       return nullptr;
     }
     p += 2 + name_len;
+    while (p < end_ && detail::isSpace(*p)) {
+      ++p;
+    }
+    return (p < end_ && *p == '>') ? p + 1 : nullptr;
+  }
+
+  // Constant-length sibling of matchCloseTag for compile-time-known field
+  // names: LEN as a template parameter folds the memcmp to inline word
+  // compares instead of a libc call. Kept as a duplicate body so neither
+  // path gains a dispatch layer.
+  template<size_t LEN>
+  [[nodiscard]] auto matchCloseTagN(const char* p, const char* name) const noexcept -> const char* {
+    if (static_cast<size_t>(end_ - p) < LEN + 3 || p[0] != '<' || p[1] != '/' ||
+        std::memcmp(p + 2, name, LEN) != 0) {
+      return nullptr;
+    }
+    p += 2 + LEN;
     while (p < end_ && detail::isSpace(*p)) {
       ++p;
     }
@@ -2123,27 +2263,29 @@ class BasicParser {
   // Returns false to fall through to the normal tokenisation path; a
   // malformed attribute list records the code so the caller's next read
   // fails. WITH_ATTRS is compile-time gated by anyElementTargetHasAttrs so
-  // attribute-free schemas keep this matcher minimal and noexcept.
-  template<bool WITH_ATTRS>
-  [[nodiscard]] auto tryBeginElement(std::string_view name) noexcept(!WITH_ATTRS) -> bool {
-    const size_t name_len = name.size();
+  // attribute-free schemas keep this matcher minimal and noexcept. LEN is the
+  // compile-time name length (field names are constexpr), so the memcmp folds
+  // to inline word compares instead of a libc call. E is the element's target
+  // type, forwarded to the streamed attribute capture when it qualifies.
+  template<size_t LEN, bool WITH_ATTRS, typename E = void>
+  [[nodiscard]] auto tryBeginElement(const char* name) noexcept(!WITH_ATTRS) -> bool {
     const auto avail = static_cast<size_t>(end_ - cur_);
-    if (avail < name_len + 2 || cur_[0] != '<') {
+    if (avail < LEN + 2 || cur_[0] != '<') {
       return false;
     }
-    if (std::memcmp(cur_ + 1, name.data(), name_len) != 0) {
+    if (std::memcmp(cur_ + 1, name, LEN) != 0) {
       return false;
     }
-    const char after = cur_[1 + name_len];
+    const char after = cur_[1 + LEN];
     if (after == '>') {
-      cur_ += name_len + 2;
+      cur_ += LEN + 2;
       last_self_closing_ = false;
       has_peek_ = false;
       attributes_.clear();
       return true;
     }
-    if (after == '/' && avail > name_len + 2 && cur_[name_len + 2] == '>') {
-      cur_ += name_len + 3;
+    if (after == '/' && avail > LEN + 2 && cur_[LEN + 2] == '>') {
+      cur_ += LEN + 3;
       last_self_closing_ = true;
       has_peek_ = false;
       attributes_.clear();
@@ -2151,7 +2293,7 @@ class BasicParser {
     }
     if constexpr (WITH_ATTRS) {
       if (detail::isSpace(after)) {
-        return beginAttributedElement(name_len);
+        return beginAttributedElement<E>(LEN);
       }
     }
     return false;
@@ -2159,17 +2301,253 @@ class BasicParser {
 
   // Attributed-tag continuation of tryBeginElement: the name already matched,
   // so skip re-scanning and hashing it and go straight to the attribute list.
-  // Outlined to keep tryBeginElement's inline body small.
+  // Outlined to keep tryBeginElement's inline body small. E is the type the
+  // element deserializes into; when it qualifies, attributes are captured in
+  // one streamed typed pass instead of the attributes_ vector.
+  template<typename E = void>
   [[nodiscard]] auto beginAttributedElement(size_t name_len) -> bool {
     cur_ += 1 + name_len;
     has_peek_ = false;
-    attributes_.clear();
     bool self_closing = false;
-    if (!parseAttributes(self_closing)) {
-      return false;
+    if constexpr (detail::streamsAttrs<E, STRICT>()) {
+      if (!streamAttrs<E>(self_closing)) {
+        return false;
+      }
+    } else {
+      attributes_.clear();
+      if (!parseAttributes(self_closing)) {
+        return false;
+      }
     }
     last_self_closing_ = self_closing;
     return true;
+  }
+
+  // Scans a quoted attribute value starting at cur_ (just past the opening
+  // quote). Returns the value end, or nullptr on unterminated input (error
+  // recorded). Duplicates parseAttributes' probe-then-memchr scan so neither
+  // hot path gains a dispatch layer.
+  [[nodiscard]] auto scanAttrValue(char quote) -> const char* {
+    // Values are typically short: probe the first bytes inline before paying
+    // the memchr call overhead in findByte (short runs favor the byte loop).
+    const char* val_end = cur_;
+    const char* const probe_limit = (end_ - cur_ < 16) ? end_ : cur_ + 16;
+    while (val_end != probe_limit && *val_end != quote) {
+      ++val_end;
+    }
+    if (val_end == probe_limit && (val_end == end_ || *val_end != quote)) {
+      val_end = findByte(val_end, quote);
+    }
+    if (val_end == end_) {
+      fail(ErrorCode::UnterminatedAttributeValue);
+      return nullptr;
+    }
+    return val_end;
+  }
+
+  // Matches E's K-th attribute as `name="` / `name='` at cur_ with one
+  // constant-length compare. On a hit consumes through the opening quote and
+  // returns the quote character; returns 0 on a miss (cur_ untouched).
+  template<typename E, size_t K>
+  [[nodiscard]] auto matchAttrPattern() noexcept -> char {
+    constexpr auto& pat = detail::ATTR_PATTERN<E, K>;
+    constexpr size_t LEN = pat.size();  // name + '='
+    if (static_cast<size_t>(end_ - cur_) < LEN + 2) {
+      return 0;
+    }
+    if (std::memcmp(cur_, pat.data(), LEN) != 0) {
+      return 0;
+    }
+    const char quote = cur_[LEN];
+    if (quote != '"' && quote != '\'') {
+      return 0;
+    }
+    cur_ += LEN + 1;
+    return quote;
+  }
+
+  // One step of streamAttrs' unrolled document-order phase: consume leading
+  // whitespace, recognize the tag terminator, then match ordinal K's pattern
+  // and capture its value. Returns 0 to advance to the next ordinal, 1 when
+  // the tag closed, 2 when the ordered run broke (this attribute goes to the
+  // generic loop), and -1 on a recorded error.
+  template<typename E, size_t K>
+  [[nodiscard]] auto streamAttrOrdinal(bool& self_closing, size_t& count) -> int {
+    skipWhitespace();
+    if (atEnd()) {
+      fail(ErrorCode::UnclosedTag);
+      return -1;
+    }
+    const char c = *cur_;
+    if (c == '>') {
+      ++cur_;
+      return 1;
+    }
+    if (c == '/' && cur_ + 1 < end_ && *(cur_ + 1) == '>') {
+      cur_ += 2;
+      self_closing = true;
+      return 1;
+    }
+    if (!detail::isNameStart(c)) {
+      fail(ErrorCode::ExpectedAttributeName);
+      return -1;
+    }
+    if (++count > MAX_ATTRIBUTES_PER_ELEMENT) [[unlikely]] {
+      fail(ErrorCode::TooManyAttributes);
+      return -1;
+    }
+    const char quote = matchAttrPattern<E, K>();
+    if (quote == 0) {
+      --count;  // the generic loop re-counts this attribute
+      return 2;
+    }
+    const char* const val_start = cur_;
+    const char* const val_end = scanAttrValue(quote);
+    if (val_end == nullptr) {
+      return -1;
+    }
+    if constexpr (STRICT) {
+      // Same checks and order as parseAttributes; phase 1 visits attributes in
+      // document order, so the recorded error code matches the vector path.
+      if (findByte(val_start, '<') < val_end) {
+        fail(ErrorCode::LtInAttributeValue);
+        return -1;
+      }
+      if (containsForbiddenControl(val_start, val_end)) {
+        fail(ErrorCode::ForbiddenControlChar);
+        return -1;
+      }
+    }
+    attr_vals_[K] = {val_start, static_cast<size_t>(val_end - val_start)};
+    attr_have_ |= uint32_t{1} << K;
+    cur_ = val_end + 1;
+    return 0;
+  }
+
+  // Streamed typed attribute capture: scans a start-tag's attribute list,
+  // matching names against E's compile-time attribute patterns in document
+  // order and storing raw value views into attr_vals_ by ordinal. Names that
+  // miss the ordered pattern (out-of-order, prefixed, whitespace around '=',
+  // unknown) take the generic arm, which resyncs the ordinal cursor exactly
+  // like attr()'s document-order fallback. First match wins, matching the
+  // vector path's first-match scan. Strict mode has no generic arm: any
+  // deviation rewinds and re-parses through parseAttributes so its duplicate
+  // and well-formedness semantics apply verbatim. cur_ must be just past the
+  // element name.
+  template<typename E>
+  [[nodiscard]] [[gnu::noinline]] auto streamAttrs(bool& self_closing) -> bool {
+    constexpr size_t NA = detail::N_ATTR_FIELDS<E>;
+    [[maybe_unused]] const char* const attrs_start = cur_;  // strict rewind point
+    attr_have_ = 0;
+    size_t count = 0;  // parsed attributes, for the element-wide bound
+
+    // Phase 1: unrolled document-order matching — each ordinal's compare sits
+    // at its own code position, so a schema-ordered attribute list runs
+    // straight through with no runtime ordinal dispatch.
+    int st = 0;
+    [&]<size_t... K>(std::index_sequence<K...>) {
+      std::ignore = ((st = streamAttrOrdinal<E, K>(self_closing, count), st == 0) && ...);
+    }(std::make_index_sequence<NA>{});
+    if (st == 1) {
+      attr_streamed_ = true;
+      return true;
+    }
+    if (st < 0) {
+      return false;
+    }
+
+    if constexpr (STRICT) {
+      // All ordinals matched (each fold step checks the terminator before its
+      // pattern, so a fully-populated in-order list leaves '>' unconsumed):
+      // consume the terminator and finish streamed.
+      skipWhitespace();
+      if (cur_ < end_ && *cur_ == '>') {
+        ++cur_;
+        attr_streamed_ = true;
+        return true;
+      }
+      if (end_ - cur_ >= 2 && cur_[0] == '/' && cur_[1] == '>') {
+        cur_ += 2;
+        self_closing = true;
+        attr_streamed_ = true;
+        return true;
+      }
+      // The list deviates from the schema-ordered shape (out-of-order,
+      // unknown, prefixed, whitespace around '=', duplicate): re-parse it
+      // through parseAttributes, where strict's duplicate and well-formedness
+      // checks live. Error codes match the vector path by construction.
+      cur_ = attrs_start;
+      attr_have_ = 0;
+      attributes_.clear();
+      return parseAttributes(self_closing);
+    } else {
+      // Phase 2: generic loop for whatever remains — out-of-order, prefixed,
+      // whitespace-shaped, or unknown attributes (and any extras after all
+      // ordinals matched). Matches by local-name hash; first match wins.
+      while (true) {
+        skipWhitespace();
+        if (atEnd()) {
+          return fail(ErrorCode::UnclosedTag);
+        }
+        const char c = *cur_;
+        if (c == '>') {
+          ++cur_;
+          attr_streamed_ = true;
+          return true;
+        }
+        if (c == '/' && cur_ + 1 < end_ && *(cur_ + 1) == '>') {
+          cur_ += 2;
+          self_closing = true;
+          attr_streamed_ = true;
+          return true;
+        }
+        if (!detail::isNameStart(c)) {
+          return fail(ErrorCode::ExpectedAttributeName);
+        }
+        if (++count > MAX_ATTRIBUTES_PER_ELEMENT) [[unlikely]] {
+          return fail(ErrorCode::TooManyAttributes);
+        }
+        std::string_view prefix;
+        std::string_view name;
+        FieldHash hash{};
+        parseName(prefix, name, hash);
+        char quote = 0;
+        if (end_ - cur_ >= 2 && cur_[0] == '=' && (cur_[1] == '"' || cur_[1] == '\'')) {
+          // Common shape: name="value" with no whitespace around '='.
+          quote = cur_[1];
+          cur_ += 2;
+        } else {
+          skipWhitespace();
+          if (!expect('=')) {
+            return fail(ErrorCode::ExpectedEquals);
+          }
+          skipWhitespace();
+          quote = peekChar();
+          if (quote != '"' && quote != '\'') {
+            return fail(ErrorCode::ExpectedQuotedValue);
+          }
+          ++cur_;
+        }
+        const char* const val_start = cur_;
+        const char* const val_end = scanAttrValue(quote);
+        if (val_end == nullptr) {
+          return false;
+        }
+        cur_ = val_end + 1;
+        static constexpr auto ATTR_HASHES = detail::makeAttrHashesByOrdinal<E>();
+        for (size_t j = 0; j < NA; ++j) {
+          if (ATTR_HASHES[j] == hash) {
+            const auto bit = uint32_t{1} << j;
+            if ((attr_have_ & bit) == 0) {
+              attr_vals_[j] = {val_start, static_cast<size_t>(val_end - val_start)};
+              attr_have_ |= bit;
+            }
+            break;
+          }
+        }
+        // Unknown attribute: value already consumed, nothing stored.
+      }
+    }
   }
 
   // Post-consume dispatch: opening tag already consumed, route to the correct
@@ -2202,7 +2580,8 @@ class BasicParser {
       if constexpr (XmlFixedContainer<M>) {
         using Traits = XmlContainerTraits<M>;
         if (arr_fill[I] < Traits::capacity) {
-          if (!p.readElement(f.xml_name, Traits::at(obj.*(f.member), arr_fill[I]), depth + 1)) {
+          if (!p.readElement<f.xml_name.size()>(
+                  f.xml_name, Traits::at(obj.*(f.member), arr_fill[I]), depth + 1)) {
             return false;
           }
           ++arr_fill[I];
@@ -2213,12 +2592,13 @@ class BasicParser {
         static_assert(XmlDynContainer<M>,
                       "container member requires XmlContainerTraits specialization");
         return detail::readIntoNew(obj.*(f.member), [&p, depth](auto& elem) {
-          return p.readElement(std::get<I>(XmlMetadata<T>::fields).xml_name, elem, depth + 1);
+          constexpr auto& fld = std::get<I>(XmlMetadata<T>::fields);
+          return p.readElement<fld.xml_name.size()>(fld.xml_name, elem, depth + 1);
         });
       }
       return true;
     } else {
-      return p.readElement(f.xml_name, obj.*(f.member), depth + 1);
+      return p.readElement<f.xml_name.size()>(f.xml_name, obj.*(f.member), depth + 1);
     }
   }
 
@@ -2233,6 +2613,26 @@ class BasicParser {
     }
   }
 
+  // Streamed counterpart of applyAttr: the value view was captured by ordinal
+  // in streamAttrs, so matching is a bit test instead of a hash scan.
+  template<typename T, size_t I>
+  static auto applyStreamedAttr(BasicParser& p, T& obj, detail::RequiredMaskT<T>& parsed) -> void {
+    constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
+    if constexpr (f.kind == FieldKind::Attr) {
+      constexpr size_t K = detail::ATTR_ORDINAL<T, I>;
+      if ((p.attr_have_ & (uint32_t{1} << K)) != 0 &&
+          p.assignAttrChecked(p.attr_vals_[K], obj.*(f.member))) {
+        parsed.set(I);
+      }
+    }
+  }
+
+  template<typename T, size_t... I>
+  static auto dispatchStreamedAttrs(BasicParser& p, T& obj, detail::RequiredMaskT<T>& parsed,
+                                    std::index_sequence<I...>) -> void {
+    (applyStreamedAttr<T, I>(p, obj, parsed), ...);
+  }
+
   // Direct dispatch to readField<T, I> for a runtime field index: a
   // compile-time fold of compares the inliner can see through, instead of an
   // opaque function-pointer table. idx must be < sizeof...(I).
@@ -2243,6 +2643,52 @@ class BasicParser {
     bool ok = false;
     std::ignore =
         ((idx == I && (ok = readField<T, I>(p, obj, depth, arr_fill, parsed), true)) || ...);
+    return ok;
+  }
+
+  // Fused hint dispatch: match the hinted field's open tag with a
+  // constant-length compare and, on a hit, read the field in one step. Only
+  // element kinds participate (the hint tables never point elsewhere; the
+  // other arms exist solely so the fold compiles). `matched` reports the tag
+  // hit; the return value is the read result (true when the tag missed).
+  template<typename T, size_t I>
+  static auto tryReadField(BasicParser& p, T& obj, uint16_t depth, std::span<size_t> arr_fill,
+                           detail::RequiredMaskT<T>& parsed, bool& matched) -> bool {
+    constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
+    if constexpr (detail::isElementKind(f.kind)) {
+      constexpr bool WITH_ATTRS = detail::ANY_ELEM_TARGET_HAS_ATTRS<T>;
+      using M = std::decay_t<decltype(obj.*(f.member))>;
+      // Type this field's element deserializes into: drives the streamed
+      // attribute capture. List fields bind token containers, not objects.
+      constexpr auto target = [] {
+        if constexpr (f.kind == FieldKind::Container) {
+          return std::type_identity<
+              detail::ElementTargetT<typename XmlContainerTraits<M>::value_type>>{};
+        } else if constexpr (f.kind == FieldKind::Element) {
+          return std::type_identity<detail::ElementTargetT<M>>{};
+        } else {
+          return std::type_identity<void>{};
+        }
+      }();
+      using E = typename decltype(target)::type;
+      if (!p.tryBeginElement<f.xml_name.size(), WITH_ATTRS, E>(f.xml_name.data())) {
+        return true;
+      }
+      matched = true;
+      return readField<T, I>(p, obj, depth, arr_fill, parsed);
+    } else {
+      return true;
+    }
+  }
+
+  template<typename T, size_t... I>
+  static auto tryReadFieldAt(size_t hint, BasicParser& p, T& obj, uint16_t depth,
+                             std::span<size_t> arr_fill, detail::RequiredMaskT<T>& parsed,
+                             bool& matched, std::index_sequence<I...> /*seq*/) -> bool {
+    bool ok = true;
+    std::ignore =
+        ((hint == I && (ok = tryReadField<T, I>(p, obj, depth, arr_fill, parsed, matched), true)) ||
+         ...);
     return ok;
   }
 
@@ -2287,19 +2733,27 @@ class BasicParser {
   template<XmlObject T>
   auto pull(T& object, uint16_t depth) -> bool;
 
-  // Opening tag already consumed by caller.
-  template<typename T>
+  // Opening tag already consumed by caller. NAME_LEN, when nonzero, is the
+  // compile-time length of expected_name and routes close-tag matching
+  // through the constant-length matcher.
+  template<size_t NAME_LEN = 0, typename T>
   auto readElement(std::string_view expected_name, T& out, uint16_t depth) -> bool;
 
-  Token current_token_;
-  std::vector<Attribute> attributes_;
-  std::string scalar_buf_;  // scratch for comment/PI-split or normalized scalar leaves
-  std::string_view src_;
+  // Hot cursor state first: every scan touches cur_/end_ and the flags, so
+  // they share the object's first cache line instead of sitting behind the
+  // large reused buffers.
   const char* cur_;
   const char* end_;
+  uint32_t attr_have_{};  // ordinal bitset over attr_vals_ (streamed capture)
   ErrorCode error_code_{ErrorCode::None};
   bool last_self_closing_{};
   bool has_peek_{false};
+  bool attr_streamed_{false};  // current element's attributes are in attr_vals_
+  std::string_view src_;
+  Token current_token_;
+  std::vector<Attribute> attributes_;
+  std::string scalar_buf_;  // scratch for comment/PI-split or normalized scalar leaves
+  std::array<std::string_view, 32> attr_vals_;  // streamed raw values by ordinal
 };
 
 /// @brief Default parser: raw, zero-copy output, and the fast non-validating
@@ -2602,23 +3056,7 @@ inline auto BasicParser<Opts>::attr(const FieldHash hash, T& out, size_t& pos) -
     idx = static_cast<size_t>(it - attributes_.begin());
     pos = idx + 1;
   }
-  const Attribute& a = attributes_[idx];
-  if constexpr (XmlOptional<T>) {
-    // Parse into a temporary so a parse failure leaves the optional empty
-    typename T::value_type tmp{};
-    if (!assignAttrValue(tmp, a)) {
-      return false;
-    }
-    out = std::move(tmp);
-    return true;
-  } else {
-    // The attribute is present; a parse failure here is a malformed value
-    if (!assignAttrValue(out, a)) {
-      fail(scalarError<T>());
-      return false;
-    }
-    return true;
-  }
+  return assignAttrChecked(attributes_[idx].value, out);
 }
 
 template<ParserOptions Opts>
@@ -2640,10 +3078,17 @@ inline auto BasicParser<Opts>::beginElement(std::string_view expected_name) -> b
 }
 
 template<ParserOptions Opts>
+template<size_t NAME_LEN>
 inline auto BasicParser<Opts>::endElement(std::string_view expected_name) -> bool {
   if (!has_peek_) {
     skipWhitespace();
-    if (const char* past = matchCloseTag(cur_, expected_name)) {
+    const char* past = nullptr;
+    if constexpr (NAME_LEN != 0) {
+      past = matchCloseTagN<NAME_LEN>(cur_, expected_name.data());
+    } else {
+      past = matchCloseTag(cur_, expected_name);
+    }
+    if (past != nullptr) {
       cur_ = past;
       return true;
     }
@@ -2748,7 +3193,7 @@ inline auto BasicParser<Opts>::skipElement() -> void {
 
 // Opening tag already consumed by the caller.
 template<ParserOptions Opts>
-template<typename T>
+template<size_t NAME_LEN, typename T>
 inline auto BasicParser<Opts>::readElement(std::string_view expected_name, T& out,
                                            const uint16_t depth) -> bool {
   if (depth > MAX_DEPTH) {
@@ -2760,10 +3205,10 @@ inline auto BasicParser<Opts>::readElement(std::string_view expected_name, T& ou
     // Optional/recursive child: allocate, then parse the element into it. The
     // depth guard above bounds recursion; the unwrap keeps the same depth.
     out = std::make_unique<typename T::element_type>();
-    return readElement(expected_name, *out, depth);
+    return readElement<NAME_LEN>(expected_name, *out, depth);
   } else if constexpr (XmlOptional<T>) {
     // Element present -> engage the optional and parse the inner value/object.
-    return readElement(expected_name, out.emplace(), depth);
+    return readElement<NAME_LEN>(expected_name, out.emplace(), depth);
   } else if constexpr (XmlScalar<T>) {
     if (is_self_closing) {
       if constexpr (XmlStringLike<T>) {
@@ -2776,12 +3221,23 @@ inline auto BasicParser<Opts>::readElement(std::string_view expected_name, T& ou
     // actually carries a reference ('&') or CR; those are the sole bytes text
     // normalization rewrites, so otherwise the raw run parses identically here.
     const char* found = findByte(cur_, '<');
-    const char* past_close = found != end_ ? matchCloseTag(found, expected_name) : nullptr;
+    const char* past_close = nullptr;
+    if (found != end_) {
+      if constexpr (NAME_LEN != 0) {
+        past_close = matchCloseTagN<NAME_LEN>(found, expected_name.data());
+      } else {
+        past_close = matchCloseTag(found, expected_name);
+      }
+    }
     if (past_close != nullptr) {
       const std::string_view text{cur_, static_cast<size_t>(found - cur_)};
       bool fast = true;  // NOLINT(misc-const-correctness): mutable only when normalizing
       if constexpr (NORMALIZE && !XmlStringLike<T>) {
-        fast = text.find_first_of("&\r") == std::string_view::npos;
+        // Numeric/enum leaves are a handful of bytes: the branchless loop
+        // beats the find_first_of libcall on the no-reference common case.
+        for (const char ch : text) {
+          fast &= ch != '&' && ch != '\r';
+        }
       }
       if (fast) {
         if constexpr (STRICT) {
@@ -2805,7 +3261,7 @@ inline auto BasicParser<Opts>::readElement(std::string_view expected_name, T& ou
   } else {
     static_assert(XmlObject<T>, "field type must be XmlScalar or an XmlObject with XmlMetadata");
     const bool result = pull(out, depth);
-    if (!is_self_closing && !endElement(expected_name)) {
+    if (!is_self_closing && !endElement<NAME_LEN>(expected_name)) {
       return false;
     }
     return result;
@@ -2837,19 +3293,30 @@ inline auto BasicParser<Opts>::pull(T& object, const uint16_t depth) -> bool {
   static constexpr auto REQUIRED_MASK = detail::makeRequiredMask<T>();
   constexpr bool HAS_REQUIRED = detail::HAS_REQUIRED_FIELDS<T>;
   [[maybe_unused]] detail::RequiredMaskT<T> parsed{};  // NOLINT(misc-const-correctness)
-  const auto check_required = [this, &parsed]() -> bool {
+  const auto check_required = [](BasicParser& self, const detail::RequiredMaskT<T>& have) -> bool {
     if constexpr (HAS_REQUIRED) {
-      if (!parsed.containsAll(REQUIRED_MASK)) {
-        return fail(ErrorCode::MissingRequiredField);
+      if (!have.containsAll(REQUIRED_MASK)) {
+        return self.fail(ErrorCode::MissingRequiredField);
       }
     }
     return true;
   };
 
-  // Apply attribute fields only when the type actually has some.
+  // Apply attribute fields only when the type actually has some. Streamed
+  // capture (attr_streamed_) is per-element state set by streamAttrs and
+  // consumed exactly once here.
   constexpr bool HAS_ATTRS = detail::HAS_ATTR_FIELDS<T>;
   if constexpr (HAS_ATTRS) {
-    dispatchAttrs<T>(*this, object, parsed, IDX_SEQ);
+    if constexpr (detail::streamsAttrs<T, STRICT>()) {
+      if (attr_streamed_) {
+        attr_streamed_ = false;
+        dispatchStreamedAttrs<T>(*this, object, parsed, IDX_SEQ);
+      } else {
+        dispatchAttrs<T>(*this, object, parsed, IDX_SEQ);
+      }
+    } else {
+      dispatchAttrs<T>(*this, object, parsed, IDX_SEQ);
+    }
     // A string attribute may have carried a malformed/undefined reference
     if (error()) [[unlikely]] {
       return false;
@@ -2888,9 +3355,9 @@ inline auto BasicParser<Opts>::pull(T& object, const uint16_t depth) -> bool {
     if (present) {
       parsed.set(VALUE_IDX);
     }
-    return check_required();
+    return check_required(*this, parsed);
   } else if (last_self_closing_) {
-    return check_required();
+    return check_required(*this, parsed);
   }
 
   // Document-order hint: index of the field expected next. Schema-ordered
@@ -2898,8 +3365,6 @@ inline auto BasicParser<Opts>::pull(T& object, const uint16_t depth) -> bool {
   // documents miss once, re-sync at the dispatch site, and stay correct.
   constexpr bool HAS_ELEMS = detail::HAS_ELEMENT_FIELDS<T>;
   constexpr bool HAS_VARIANTS = detail::HAS_VARIANT_FIELDS<T>;
-  constexpr bool ATTR_TAGS = detail::ANY_ELEM_TARGET_HAS_ATTRS<T>;
-  static constexpr auto NAMES = detail::makeFieldNames<T>();
   static constexpr auto NEXT_ELEM = detail::makeNextElemTable<T>();
   [[maybe_unused]] size_t hint = detail::FIRST_ELEM_INDEX<T>;  // NOLINT(misc-const-correctness)
 
@@ -2910,24 +3375,19 @@ inline auto BasicParser<Opts>::pull(T& object, const uint16_t depth) -> bool {
         return fail(ErrorCode::UnexpectedEof);
       }
       if (cur_[0] == '<' && cur_ + 1 < end_ && cur_[1] == '/') {
-        return check_required();
+        return check_required(*this, parsed);
       }
 
-      // Fast path: match the hinted open tag via memcmp, bypassing full
-      // tokenisation (parseName, hash, peek machinery).
-      if constexpr (HAS_ELEMS && N == 1) {
-        // Single-field types: compile-time tag name and direct call.
-        if (tryBeginElement<ATTR_TAGS>(NAMES[0])) {
-          if (!readField<T, 0>(*this, object, depth, arr_fill, parsed)) {
-            return false;
-          }
-          continue;
+      // Fast path: match the hinted open tag, bypassing full tokenisation
+      // (parseName, hash, peek machinery). The per-field fused dispatch keeps
+      // every tag compare a compile-time-length memcmp that folds to inline
+      // word compares instead of a libc call.
+      if constexpr (HAS_ELEMS) {
+        bool matched = false;
+        if (!tryReadFieldAt(hint, *this, object, depth, arr_fill, parsed, matched, IDX_SEQ)) {
+          return false;
         }
-      } else if constexpr (HAS_ELEMS) {
-        if (tryBeginElement<ATTR_TAGS>(NAMES[hint])) {
-          if (!readFieldAt(hint, *this, object, depth, arr_fill, parsed, IDX_SEQ)) {
-            return false;
-          }
+        if (matched) {
           hint = NEXT_ELEM[hint];
           continue;
         }
@@ -2941,7 +3401,7 @@ inline auto BasicParser<Opts>::pull(T& object, const uint16_t depth) -> bool {
       return false;
     }
     if (token->type == TokenType::ElementClose) {
-      return check_required();
+      return check_required(*this, parsed);
     }
     if (token->type != TokenType::ElementOpen) {
       consume();
@@ -3190,9 +3650,13 @@ class Serializer {
   // Writes the active alternative of a variant under its bound element name.
   template<typename FieldT, typename Var>
   auto writeVariantActive(const FieldT& f, const Var& var, int depth) -> void {
-    [this, &f, &var, depth]<size_t... J>(std::index_sequence<J...>) {
-      (..., (var.index() == J ? writeFieldValue(f.names[J], std::get<J>(var), depth) : void()));
-    }(std::make_index_sequence<std::variant_size_v<Var>>{});
+    writeVariantAlt(f, var, depth, std::make_index_sequence<std::variant_size_v<Var>>{});
+  }
+
+  template<typename FieldT, typename Var, size_t... J>
+  auto writeVariantAlt(const FieldT& f, const Var& var, int depth,
+                       std::index_sequence<J...>) -> void {
+    (..., (var.index() == J ? writeFieldValue(f.names[J], std::get<J>(var), depth) : void()));
   }
 
   template<typename T, size_t I>
@@ -3218,7 +3682,9 @@ class Serializer {
         }
       }
     } else if constexpr (f.kind == FieldKind::Container) {
-      detail::forEachItem(obj.*(f.member), [this, depth](const auto& item) {
+      using M = std::decay_t<decltype(obj.*(f.member))>;
+      detail::forEachItem(obj.*(f.member),
+                          [this, depth](const typename XmlContainerTraits<M>::value_type& item) {
         writeFieldValue(std::get<I>(XmlMetadata<T>::fields).xml_name, item, depth);
       });
     } else {

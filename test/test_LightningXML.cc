@@ -1668,6 +1668,138 @@ TEST_F(LightningBasicTests, StrictParserNormalizes) {
   EXPECT_EQ(r.attr, "x\ty");   // &#9; preserved as a literal tab
 }
 
+/// @brief Strict streamed attributes: attribute lists on a child element (the
+/// hint fast path, where streamAttrs runs) parse identically to the fast
+/// parser across every shape — schema-ordered full set (terminator epilogue),
+/// ordered prefix (in-fold terminator), and each deviating shape that rewinds
+/// through parseAttributes.
+TEST_F(LightningBasicTests, StrictStreamedAttrShapesMatchFastParser) {
+  constexpr auto CASES = std::to_array<std::string_view>({
+      // Full set, in order, self-closing: the fold exhausts and the epilogue
+      // consumes '/>'.
+      R"(<AttrList><Item a1="10" a2="20" a3="30" a4="40" a5="50" s1="one" s2="two" s3="three" s4="four" s5="five"/></AttrList>)",
+      // Full set, whitespace before the terminator, open + close tag.
+      R"(<AttrList><Item a1="10" a2="20" a3="30" a4="40" a5="50" s1="one" s2="two" s3="three" s4="four" s5="five" ></Item></AttrList>)",
+      // Ordered prefix: the terminator is recognized inside the fold.
+      R"(<AttrList><Item a1="10" a2="20"/></AttrList>)",
+      // Out of order: rewinds to parseAttributes.
+      R"(<AttrList><Item s5="five" a1="10" s1="one" a5="50" a2="20" s2="two" a3="30" s4="four" a4="40" s3="three"/></AttrList>)",
+      // Unknown attribute up front: rewinds.
+      R"(<AttrList><Item zz="?" a1="10" a2="20" s1="one"/></AttrList>)",
+      // Whitespace around '=': rewinds.
+      R"(<AttrList><Item a1 = "10" a2="20"/></AttrList>)",
+      // Unknown extra after the full set: epilogue miss rewinds.
+      R"(<AttrList><Item a1="10" a2="20" a3="30" a4="40" a5="50" s1="one" s2="two" s3="three" s4="four" s5="five" zz="?"/></AttrList>)",
+      // Prefixed names with the same local name: rewinds, not a duplicate.
+      R"(<AttrList><Item a:s1="x" b:s1="y"/></AttrList>)",
+  });
+  for (const auto& xml_src : CASES) {
+    xmlight::Parser fast{xml_src};
+    xmlight::StrictParser strict{xml_src};
+    AttrList want;
+    AttrList got;
+    ASSERT_TRUE(xmlight::deserialize(fast, "AttrList", want)) << xml_src;
+    ASSERT_TRUE(xmlight::deserialize(strict, "AttrList", got)) << xml_src;
+    ASSERT_EQ(got.items.size(), want.items.size()) << xml_src;
+    for (size_t i = 0; i < want.items.size(); ++i) {
+      const auto& w = want.items[i];
+      const auto& g = got.items[i];
+      EXPECT_EQ(g.a1, w.a1) << xml_src;
+      EXPECT_EQ(g.a2, w.a2) << xml_src;
+      EXPECT_EQ(g.a3, w.a3) << xml_src;
+      EXPECT_EQ(g.a4, w.a4) << xml_src;
+      EXPECT_EQ(g.a5, w.a5) << xml_src;
+      EXPECT_EQ(g.s1, w.s1) << xml_src;
+      EXPECT_EQ(g.s2, w.s2) << xml_src;
+      EXPECT_EQ(g.s3, w.s3) << xml_src;
+      EXPECT_EQ(g.s4, w.s4) << xml_src;
+      EXPECT_EQ(g.s5, w.s5) << xml_src;
+    }
+  }
+}
+
+/// @brief Strict WFC violations on a child element's attribute list are still
+/// caught with streaming enabled: the value checks fire inline in phase 1, and
+/// everything else is caught by the rewind through parseAttributes.
+TEST_F(LightningBasicTests, StrictStreamedAttrRejections) {
+  constexpr auto CASES = std::to_array<std::pair<std::string_view, xmlight::ErrorCode>>({
+      // '<' in a phase-1-matched value.
+      {R"(<AttrList><Item a1="1<2"/></AttrList>)", xmlight::ErrorCode::LtInAttributeValue},
+      // Control byte in a phase-1-matched value.
+      {"<AttrList><Item a1=\"1\x01\"/></AttrList>", xmlight::ErrorCode::ForbiddenControlChar},
+      // Duplicate of an earlier ordinal: pattern miss, rewind, WFC check.
+      {R"(<AttrList><Item a1="1" a1="2"/></AttrList>)", xmlight::ErrorCode::DuplicateAttribute},
+      // Duplicate after the full set: epilogue miss, rewind, WFC check.
+      {R"(<AttrList><Item a1="10" a2="20" a3="30" a4="40" a5="50" s1="one" s2="two" s3="three" s4="four" s5="five" s5="again"/></AttrList>)",
+       xmlight::ErrorCode::DuplicateAttribute},
+      // Unquoted value: the rewind reproduces the legacy error.
+      {R"(<AttrList><Item a1=1/></AttrList>)", xmlight::ErrorCode::ExpectedQuotedValue},
+      // Truncated inside a value.
+      {R"(<AttrList><Item a1="1)", xmlight::ErrorCode::UnterminatedAttributeValue},
+      // Truncated in the attribute list.
+      {R"(<AttrList><Item a1="1" )", xmlight::ErrorCode::UnclosedTag},
+  });
+  for (const auto& [xml_src, want] : CASES) {
+    xmlight::StrictParser p{xml_src};
+    AttrList list;
+    EXPECT_FALSE(xmlight::deserialize(p, "AttrList", list)) << xml_src;
+    EXPECT_EQ(p.errorCode(), want) << xml_src;
+  }
+}
+
+/// @brief Fused strict CharData validation: "]]>" spanning a 16-byte chunk
+/// boundary, CDataEndInContent precedence over ForbiddenControlChar in both
+/// document orders, and no false positives on trailing or dense ']' content —
+/// through the scalar-leaf fast path and the tokenized mixed-content path.
+TEST_F(LightningBasicTests, StrictCharDataValidationFused) {
+  const std::string fourteen(14, 'a');
+  const std::string fifteen(15, 'a');
+  const std::string sixteen(16, 'a');
+  const auto REJECT = std::to_array<std::pair<std::string, xmlight::ErrorCode>>({
+      // "]]" ends the first 16-byte chunk, '>' opens the next.
+      {fourteen + "]]>", xmlight::ErrorCode::CDataEndInContent},
+      // "]]>" split ']' / "]>" across the chunk boundary.
+      {fifteen + "]]>", xmlight::ErrorCode::CDataEndInContent},
+      // Control byte before a later "]]>": the delimiter still wins.
+      {"a\x01" + std::string(18, 'b') + "]]>zz", xmlight::ErrorCode::CDataEndInContent},
+      // "]]" without '>' ruled out, control byte in a later chunk reports.
+      {"]]" + std::string(20, 'b') + "\x01" + std::string(10, 'c'),
+       xmlight::ErrorCode::ForbiddenControlChar},
+      // Short run: byte-loop tail only.
+      {std::string("b\x01d"), xmlight::ErrorCode::ForbiddenControlChar},
+  });
+  for (const auto& [text, want] : REJECT) {
+    const std::string xml = "<NormText><v>" + text + "</v></NormText>";
+    xmlight::StrictParser p{xml};
+    NormText t;
+    EXPECT_FALSE(xmlight::deserialize(p, "NormText", t)) << xml;
+    EXPECT_EQ(p.errorCode(), want) << xml;
+    // Same run through the tokenized mixed-content path.
+    const std::string mixed = "<NormText><v>ok<!--c-->" + text + "</v></NormText>";
+    xmlight::StrictParser pm{mixed};
+    NormText tm;
+    EXPECT_FALSE(xmlight::deserialize(pm, "NormText", tm)) << mixed;
+    EXPECT_EQ(pm.errorCode(), want) << mixed;
+  }
+  std::string dense;
+  for (int i = 0; i < 20; ++i) {
+    dense += "]x";
+  }
+  const auto ACCEPT = std::to_array<std::string>({
+      sixteen + "]",   // ']' as the final byte after a clean chunk
+      fifteen + "]]",  // "]]" with no '>' at the very end
+      dense,           // ']'-dense long run: one containsCdataEnd resolution
+      "a\tb\nc",       // legal whitespace controls
+  });
+  for (const auto& text : ACCEPT) {
+    const std::string xml = "<NormText><v>" + text + "</v></NormText>";
+    xmlight::StrictParser p{xml};
+    NormText t;
+    ASSERT_TRUE(xmlight::deserialize(p, "NormText", t)) << xml;
+    EXPECT_EQ(t.v, text) << xml;
+  }
+}
+
 //
 // Library extensions: lifted field ceiling, enums, value fields, recursion.
 //
