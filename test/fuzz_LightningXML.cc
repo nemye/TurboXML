@@ -11,6 +11,7 @@
 /// A parse returning false is a normal outcome, not a finding. What this
 /// catches is a crash, a sanitizer report, or a round-trip that loses data.
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -36,7 +37,10 @@ struct Alt {
 };
 
 /// Recursive through unique_ptr so the depth guard and the allocate-then-parse
-/// path are both reachable from crafted nesting.
+/// path are both reachable from crafted nesting. `slots` is a fixed container
+/// of an attributed type, so items past its capacity reach the streamed
+/// attribute capture and are then skipped; `labels` is a list of owning
+/// strings, the only list item type that can carry markup bytes.
 struct Node {
   int id{};
   std::string name;
@@ -44,7 +48,9 @@ struct Node {
   Colour colour{};
   Inner inner;
   std::vector<Inner> items;
+  std::array<Inner, 2> slots{};
   std::vector<int> numbers;
+  std::vector<std::string> labels;
   std::variant<Alt, int> choice;
   std::unique_ptr<Node> child;
 };
@@ -75,7 +81,8 @@ struct xmlight::XmlMetadata<Node> {
       xmlight::attrField("id", &Node::id), xmlight::attrField("name", &Node::name),
       xmlight::attrField("note", &Node::note), xmlight::attrField("colour", &Node::colour),
       xmlight::field("Inner", &Node::inner), xmlight::vecField("Item", &Node::items),
-      xmlight::listField("Numbers", &Node::numbers),
+      xmlight::arrField("Slot", &Node::slots), xmlight::listField("Numbers", &Node::numbers),
+      xmlight::listField("Labels", &Node::labels),
       xmlight::variantField(&Node::choice, xmlight::alt<Alt>("Alt"), xmlight::alt<int>("Num")),
       xmlight::field("Child", &Node::child));
 };

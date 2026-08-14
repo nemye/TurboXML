@@ -7,11 +7,19 @@
 - Element, attribute, and variant dispatch bound a document name to a field on an FNV-1a hash match alone. FNV-1a is invertible, so a colliding name is constructible rather than improbable; the declared name is now confirmed before the value is bound
 - `StrictParser` duplicate-attribute detection degraded to O(n^2) once a start-tag exceeded the 64-bit filter's capacity, and the `'<'`-in-attribute-value check scanned to end of input per attribute rather than to the end of the value. A 40,000-attribute tag went from 393 ms to 2.5 ms
 - `skipElement` counted nesting from zero instead of from the parser's current depth, so an unknown subtree could descend `MAX_DEPTH` again
+- Streamed attribute capture left its values live past the element they came from: an item beyond a fixed container's capacity is skipped rather than pulled, so nothing consumed the state, and the next element to read attributes by ordinal picked up the skipped element's values even with no attributes of its own
+- A child element whose name matched an attribute field satisfied that field's `required` check while leaving the member unset; presence is now recorded only for the kinds actually matched as child elements
+- Skipping a markup declaration (`<!` that is neither a comment nor CDATA) resumed by re-entering the tokenizer, costing one stack frame per declaration with nothing to bound it — `MAX_DEPTH` guards element nesting, not sibling markup. A few hundred KB of `<!>` exhausted the stack on any build that did not eliminate the tail call; the tokenizer now loops
+- `Date` accepted any day up to 31, so `2026-02-31` parsed and `toSysDays()` silently reported March 3rd. The day is now checked against its month and leap year, and the year against `std::chrono::year`'s range, which `Date` cannot represent beyond
+- A UTF-8 BOM returned from the encoding check before the XML declaration was examined, so a BOM followed by `encoding="UTF-16"` was accepted
+- `xs:list` elements were escaped with attribute rules, which leave `>` alone: an item spelling `]]>` was written into character data verbatim and the serializer's own output then failed a strict re-parse
 
 ### Added
 - Non-UTF-8 input is rejected with `ErrorCode::UnsupportedEncoding` (UTF-16/32 BOM, BOM-less UTF-16, or an XML declaration naming a non-UTF-8 encoding) instead of being scanned as bytes and reported as a missing root
 - libFuzzer target (`LIGHTNINGXML_BUILD_FUZZERS`) driving all three parser modes plus a serialize/re-parse differential, with a committed seed corpus and a bounded CI run
 - CI matrix building and testing gcc/clang across Debug and Release, so the shipped `-O3` + LTO + unity configuration is exercised
+- README documents four behaviors that previously read as defects: mixed content keeps only the last text run on the raw string path, `arrField` serializes every slot, a malformed optional attribute is left disengaged, and an `xs:list` item cannot contain whitespace
+- Fuzz model covers a fixed container of an attributed type and a list of owning strings, the two shapes whose round-trip invariants it could not previously reach
 
 ### Changed
 - clang-tidy CI job disables unity builds; with them on, `compile_commands.json` held only the generated unity sources and clang-tidy fell back to a default command that could not resolve the include path

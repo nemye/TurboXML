@@ -813,6 +813,105 @@ TEST_F(LightningBasicTests, ElementNameCollidesWithAttrField) {
   EXPECT_EQ(users.items[0].email, "c@c.com");
 }
 
+/// @brief A child element matching an attribute field's name must not count as
+/// that attribute being present.
+///
+/// findFieldIndex spans every named kind, attributes included, so `<id>` binds
+/// to the field index of attrField("id"). Recording presence before dispatching
+/// on the kind let the child element satisfy the required-attribute check while
+/// the member stayed unset.
+TEST_F(LightningBasicTests, ChildElementDoesNotSatisfyRequiredAttribute) {
+  const std::string_view missing = R"(<Record><id>999</id><Name>Collider</Name></Record>)";
+  xmlight::Parser parser{missing};
+  ReqAttrRecord record;
+  EXPECT_FALSE(xmlight::deserialize(parser, "Record", record));
+  EXPECT_EQ(parser.errorCode(), xmlight::ErrorCode::MissingRequiredField);
+
+  // The real attribute still satisfies it, and the colliding child is skipped.
+  const std::string_view present = R"(<Record id="42"><id>999</id><Name>Collider</Name></Record>)";
+  xmlight::Parser ok_parser{present};
+  ReqAttrRecord ok_record;
+  ASSERT_TRUE(xmlight::deserialize(ok_parser, "Record", ok_record));
+  EXPECT_EQ(ok_record.id, "42");
+  EXPECT_EQ(ok_record.name, "Collider");
+}
+
+/// @brief Streamed attribute values must not survive the element they were
+/// captured from.
+///
+/// A start-tag whose target type qualifies for streamed capture stores its raw
+/// values in attr_vals_ by ordinal. An item past a fixed container's capacity
+/// is skipped rather than pulled, so nothing consumed that state; the next
+/// element to read attributes by ordinal then picked up the skipped element's
+/// values, even with no attributes of its own and a different attribute name.
+TEST_F(LightningBasicTests, StreamedAttrsDoNotLeakPastFixedContainerOverflow) {
+  const std::string_view overflow =
+      R"(<Doc><Group><Slot sid="A"/><Slot sid="B"/></Group><Summary/></Doc>)";
+  xmlight::Parser parser{overflow};
+  SlotDoc doc;
+  ASSERT_TRUE(xmlight::deserialize(parser, "Doc", doc));
+  EXPECT_EQ(doc.group.slots[0].sid, "A");
+  EXPECT_EQ(doc.summary.label, "");
+
+  // The element that does carry the attribute still gets it.
+  const std::string_view labelled =
+      R"(<Doc><Group><Slot sid="A"/><Slot sid="B"/></Group><Summary label="S"/></Doc>)";
+  xmlight::Parser labelled_parser{labelled};
+  SlotDoc labelled_doc;
+  ASSERT_TRUE(xmlight::deserialize(labelled_parser, "Doc", labelled_doc));
+  EXPECT_EQ(labelled_doc.group.slots[0].sid, "A");
+  EXPECT_EQ(labelled_doc.summary.label, "S");
+}
+
+/// @brief A long run of markup declarations must cost no stack.
+///
+/// A '<!' that is neither a comment nor CDATA is skipped and produces no token.
+/// Resuming by re-entering the tokenizer spent one stack frame per declaration,
+/// which MAX_DEPTH does not bound - it guards element nesting, not sibling
+/// markup - so a few hundred KB of "<!>" exhausted the stack on any build that
+/// did not happen to eliminate the tail call.
+TEST_F(LightningBasicTests, MarkupDeclarationRunDoesNotRecurse) {
+  static constexpr size_t kDeclarations = 200000;
+  std::string decls;
+  decls.reserve(kDeclarations * 3);
+  for (size_t i = 0; i < kDeclarations; ++i) {
+    decls += "<!>";
+  }
+
+  const std::string prolog = decls + R"(<Record id="42"><Name>Deep</Name></Record>)";
+  xmlight::Parser prolog_parser{prolog};
+  ReqAttrRecord from_prolog;
+  ASSERT_TRUE(xmlight::deserialize(prolog_parser, "Record", from_prolog));
+  EXPECT_EQ(from_prolog.name, "Deep");
+
+  const std::string content = R"(<Record id="42">)" + decls + R"(<Name>Deep</Name></Record>)";
+  xmlight::Parser content_parser{content};
+  ReqAttrRecord from_content;
+  ASSERT_TRUE(xmlight::deserialize(content_parser, "Record", from_content));
+  EXPECT_EQ(from_content.name, "Deep");
+}
+
+/// @brief An xs:list element's items are escaped as character data, not as an
+/// attribute value.
+///
+/// Attribute escaping leaves '>' alone, which is legal in an attribute but lets
+/// an item spelling "]]>" reconstitute the CDATA-close delimiter once written
+/// into element text - output the serializer produced but a strict parser then
+/// rejected.
+TEST_F(LightningBasicTests, ListElementItemsEscapeAsCharacterData) {
+  StringList list;
+  list.tags.emplace_back("a]]>b");
+  list.tags.emplace_back("x<y&z");
+
+  const std::string xml = xmlight::serialize<false>("Root", list);
+  EXPECT_EQ(xml, "<Root><Tags>a]]&gt;b x&lt;y&amp;z</Tags></Root>");
+
+  xmlight::StrictParser parser{xml};
+  StringList round_tripped;
+  ASSERT_TRUE(xmlight::deserialize(parser, "Root", round_tripped));
+  EXPECT_EQ(round_tripped.tags, list.tags);
+}
+
 /// @brief Field dispatch must confirm the name after the hash matches.
 ///
 /// allNamesUnique<T>() only proves the declared names do not alias each other;
@@ -2666,6 +2765,30 @@ TEST_F(LightningBasicTests, DateTimeLexicalRejects) {
   for (const std::string_view bad : {"2026-06-18 09:30:00", "2026-06-18T09:30:00+15:00"}) {
     EXPECT_FALSE(xmlight::XmlValueTraits<xmlight::DateTime>::parse(bad, dt)) << bad;
   }
+}
+
+/// @brief A day past its month's length is not a date.
+///
+/// Bounding the day at 31 alone accepted February 31st, which chrono then rolls
+/// silently into March: toSysDays() handed back an instant the document never
+/// named. The year is bounded to std::chrono::year's range for the same reason
+/// - Date cannot represent anything wider, so a larger one only reads back
+/// wrong.
+TEST_F(LightningBasicTests, DateRejectsImpossibleCalendarDays) {
+  xmlight::Date d{};
+  for (const std::string_view bad :
+       {"2026-02-31", "2026-02-30", "2026-04-31", "2026-06-31", "2026-09-31", "2026-11-31",
+        "2025-02-29", "1900-02-29", "0000123456-01-01", "0000032768-01-01"}) {
+    EXPECT_FALSE(xmlight::XmlValueTraits<xmlight::Date>::parse(bad, d)) << bad;
+  }
+  for (const std::string_view good :
+       {"2026-01-31", "2026-02-28", "2024-02-29", "2000-02-29", "0000032767-12-31"}) {
+    EXPECT_TRUE(xmlight::XmlValueTraits<xmlight::Date>::parse(good, d)) << good;
+  }
+  // The same check reaches through dateTime, whose date half shares the cursor.
+  xmlight::DateTime dt{};
+  EXPECT_FALSE(xmlight::XmlValueTraits<xmlight::DateTime>::parse("2026-02-31T00:00:00", dt));
+  EXPECT_TRUE(xmlight::XmlValueTraits<xmlight::DateTime>::parse("2024-02-29T00:00:00", dt));
 }
 
 /// @brief Lexical edge forms: negative years round-trip with the sign and

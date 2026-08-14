@@ -730,6 +730,24 @@ TEST_F(Sec28Prolog, DoctypeEdgeCases) {
   }
 }
 
+/// Production [29] Misc* permits any number of markup declarations before the
+/// root, and nothing in the grammar bounds how many. Skipping each one must
+/// cost no stack, so a long run is a size question and not a depth one.
+TEST_F(Sec28Prolog, LongMarkupDeclarationRunIsNotDepth) {
+  static constexpr size_t kDeclarations = 200000;
+  std::string src;
+  src.reserve(kDeclarations * 3 + 32);
+  for (size_t i = 0; i < kDeclarations; ++i) {
+    src += "<!>";
+  }
+  src += "<r><v>ok</v></r>";
+
+  xmlight::Parser p{src};
+  Leaf leaf;
+  ASSERT_TRUE(xmlight::deserialize(p, "r", leaf));
+  EXPECT_EQ(leaf.text, "ok");
+}
+
 /// A partial BOM is not stripped; the bytes are treated as (skippable, since
 /// they precede the root) character data.
 TEST_F(Sec28Prolog, PartialBomNotStripped) {
@@ -760,6 +778,24 @@ TEST_F(Sec28Prolog, Utf8BomNoDeclaration) {
   Leaf leaf;
   ASSERT_TRUE(xmlight::deserialize(p, "r", leaf));
   EXPECT_EQ(leaf.text, "ok");
+}
+
+/// A UTF-8 BOM fixes the byte width but says nothing about the declared
+/// encoding, so the declaration behind it is still subject to sec 4.3.3. The
+/// BOM must not become a way to smuggle an unreadable encoding past the check.
+TEST_F(Sec28Prolog, Utf8BomDoesNotSkipEncodingDeclaration) {
+  const std::string rejected = "\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"UTF-16\"?><r/>";
+  xmlight::Parser p{rejected};
+  Leaf leaf;
+  EXPECT_FALSE(xmlight::deserialize(p, "r", leaf));
+  EXPECT_EQ(p.errorCode(), xmlight::ErrorCode::UnsupportedEncoding);
+
+  const std::string accepted =
+      "\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"UTF-8\"?><r><v>ok</v></r>";
+  xmlight::Parser ok{accepted};
+  Leaf ok_leaf;
+  ASSERT_TRUE(xmlight::deserialize(ok, "r", ok_leaf));
+  EXPECT_EQ(ok_leaf.text, "ok");
 }
 
 // sec 2.10 - White Space Handling

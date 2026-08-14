@@ -562,13 +562,16 @@ class DtCursor {
   }
 
   /// @brief Reads a year: an optional leading '-' then four or more digits.
+  /// Bounded to the std::chrono::year range (its min and max are symmetric),
+  /// since Date's chrono accessors cannot represent anything wider.
   [[nodiscard]] auto year(int& out) -> bool {
+    static constexpr int64_t MAX_YEAR = static_cast<int>(std::chrono::year::max());
     const int sign = eat('-') ? -1 : 1;
     const size_t start = pos_;
     int64_t v = 0;
     while (pos_ < s_.size() && isDigit(s_[pos_])) {
       v = v * 10 + (s_[pos_++] - '0');
-      if (v > std::numeric_limits<int>::max()) {
+      if (v > MAX_YEAR) {
         return false;
       }
     }
@@ -633,14 +636,19 @@ class DtCursor {
     return true;
   }
 
-  /// @brief Reads a 'CCYY-MM-DD' date body (no timezone) into d.
+  /// @brief Reads a 'CCYY-MM-DD' date body (no timezone) into d. The day is
+  /// checked against its month and leap year, not merely against 31: chrono
+  /// rolls an impossible date over silently, so 2026-02-31 would otherwise
+  /// parse and then read back as March 3rd.
   [[nodiscard]] auto date(Date& d) -> bool {
     uint32_t mo = 0;
     uint32_t da = 0;
     if (!year(d.year) || !eat('-') || !fixed(2, mo) || !eat('-') || !fixed(2, da)) {
       return false;
     }
-    if (mo < 1 || mo > 12 || da < 1 || da > 31) {
+    const std::chrono::year_month_day ymd{std::chrono::year{d.year}, std::chrono::month{mo},
+                                          std::chrono::day{da}};
+    if (!ymd.ok()) {
       return false;
     }
     d.month = static_cast<uint8_t>(mo);
@@ -1699,8 +1707,11 @@ class BasicParser {
     const auto avail = static_cast<size_t>(end_ - cur_);
     const auto byte = [this](size_t i) { return static_cast<uint8_t>(cur_[i]); };
 
+    // A UTF-8 BOM settles the byte width but not the declared encoding, so the
+    // declaration behind it still has to be checked.
     if (avail >= 3 && byte(0) == 0xEF && byte(1) == 0xBB && byte(2) == 0xBF) {
       cur_ += 3;
+      checkEncodingDeclaration();
       return;
     }
     // UTF-32 BOMs are checked before UTF-16: the LE forms share a prefix.
@@ -2178,6 +2189,7 @@ class BasicParser {
   }
 
   auto parseMarkup(Token& token) -> bool;
+  auto scanText(Token& token) -> bool;
   auto parseElementOpen(Token& token) -> bool;
   [[nodiscard]] auto parseAttributes(bool& self_closing) -> bool;
   auto parseElementClose(Token& token) -> bool;
@@ -2469,6 +2481,7 @@ class BasicParser {
         return false;
       }
     } else {
+      attr_streamed_ = false;
       attributes_.clear();
       if (!parseAttributes(self_closing)) {
         return false;
@@ -2712,50 +2725,53 @@ class BasicParser {
   template<typename T, size_t I>
   static auto readField(BasicParser& p, T& obj, uint16_t depth, std::span<size_t> arr_fill,
                         detail::RequiredMaskT<T>& parsed) -> bool {
-    // Reaching here means field I's element matched, so it is present. Record
-    // it for the required-field check; gated so types with no required field
-    // never touch parsed (the arg dead-codes away). Failure paths below still
-    // return false and the mask is then irrelevant.
-    if constexpr (detail::HAS_REQUIRED_FIELDS<T>) {
-      parsed.set(I);
-    }
     constexpr auto& f = std::get<I>(XmlMetadata<T>::fields);
     if constexpr (f.kind == FieldKind::Attr || f.kind == FieldKind::Value ||
                   f.kind == FieldKind::Variant) {
-      // Attr/value/variant fields aren't matched as child elements, so this arm
-      // is unreachable; it only has to compile (the readFieldAt fold spans
-      // every field index).
+      // findFieldIndex spans every named kind, so a child element whose name
+      // matches an attribute field lands here. Skip it without recording
+      // presence: a child element must not satisfy a required attribute.
+      // Value/variant fields carry no single name and cannot reach this.
       p.skipElement(depth);
       return true;
-    } else if constexpr (f.kind == FieldKind::List) {
-      if (p.last_self_closing_) {
-        return true;  // <name/> -> empty list
-      }
-      return p.readList(obj.*(f.member), f.xml_name);
-    } else if constexpr (f.kind == FieldKind::Container) {
-      using M = std::decay_t<decltype(obj.*(f.member))>;
-      if constexpr (XmlFixedContainer<M>) {
-        using Traits = XmlContainerTraits<M>;
-        if (arr_fill[I] < Traits::capacity) {
-          if (!p.readElement<f.xml_name.size()>(
-                  f.xml_name, Traits::at(obj.*(f.member), arr_fill[I]), depth + 1)) {
-            return false;
-          }
-          ++arr_fill[I];
-        } else {
-          p.skipElement(depth);
-        }
-      } else {
-        static_assert(XmlDynContainer<M>,
-                      "container member requires XmlContainerTraits specialization");
-        return detail::readIntoNew(obj.*(f.member), [&p, depth](auto& elem) {
-          constexpr auto& fld = std::get<I>(XmlMetadata<T>::fields);
-          return p.readElement<fld.xml_name.size()>(fld.xml_name, elem, depth + 1);
-        });
-      }
-      return true;
     } else {
-      return p.readElement<f.xml_name.size()>(f.xml_name, obj.*(f.member), depth + 1);
+      // Field I's element matched, so it is present. Record it for the
+      // required-field check; gated so types with no required field never touch
+      // parsed (the arg dead-codes away). Failure paths below still return
+      // false and the mask is then irrelevant.
+      if constexpr (detail::HAS_REQUIRED_FIELDS<T>) {
+        parsed.set(I);
+      }
+      if constexpr (f.kind == FieldKind::List) {
+        if (p.last_self_closing_) {
+          return true;  // <name/> -> empty list
+        }
+        return p.readList(obj.*(f.member), f.xml_name);
+      } else if constexpr (f.kind == FieldKind::Container) {
+        using M = std::decay_t<decltype(obj.*(f.member))>;
+        if constexpr (XmlFixedContainer<M>) {
+          using Traits = XmlContainerTraits<M>;
+          if (arr_fill[I] < Traits::capacity) {
+            if (!p.readElement<f.xml_name.size()>(
+                    f.xml_name, Traits::at(obj.*(f.member), arr_fill[I]), depth + 1)) {
+              return false;
+            }
+            ++arr_fill[I];
+          } else {
+            p.skipElement(depth);
+          }
+        } else {
+          static_assert(XmlDynContainer<M>,
+                        "container member requires XmlContainerTraits specialization");
+          return detail::readIntoNew(obj.*(f.member), [&p, depth](auto& elem) {
+            constexpr auto& fld = std::get<I>(XmlMetadata<T>::fields);
+            return p.readElement<fld.xml_name.size()>(fld.xml_name, elem, depth + 1);
+          });
+        }
+        return true;
+      } else {
+        return p.readElement<f.xml_name.size()>(f.xml_name, obj.*(f.member), depth + 1);
+      }
     }
   }
 
@@ -2905,7 +2921,13 @@ class BasicParser {
   ErrorCode error_code_{ErrorCode::None};
   bool last_self_closing_{};
   bool has_peek_{false};
-  bool attr_streamed_{false};  // current element's attributes are in attr_vals_
+  // True when the current element's attributes are in attr_vals_ rather than
+  // attributes_. Only streamAttrs() sets it, and every route out of the
+  // element it was set for clears it: pull() when it consumes the values,
+  // skipElement() when the element is skipped instead, and the two tokenizer
+  // paths that fill attributes_ instead. Leaving any route uncleared lets a
+  // later element read the values back by ordinal, names unchecked.
+  bool attr_streamed_{false};
   std::string_view src_;
   Token current_token_;
   std::vector<Attribute> attributes_;
@@ -3003,6 +3025,12 @@ inline auto BasicParser<Opts>::nextFromSource(Token& token) -> bool {
     ++cur_;
     return parseMarkup(token);
   }
+  return scanText(token);
+}
+
+// Character data up to the next '<', or to end of input.
+template<ParserOptions Opts>
+inline auto BasicParser<Opts>::scanText(Token& token) -> bool {
   const char* start = cur_;
   cur_ = findByte(cur_, '<');
   if constexpr (STRICT) {
@@ -3020,35 +3048,50 @@ inline auto BasicParser<Opts>::nextFromSource(Token& token) -> bool {
 
 template<ParserOptions Opts>
 inline auto BasicParser<Opts>::parseMarkup(Token& token) -> bool {
-  if (atEnd()) {
-    return makeError(token, ErrorCode::UnexpectedEndAfterLt);
-  }
-  const char c = *cur_;
-  if (c == '/') {
-    ++cur_;
-    return parseElementClose(token);
-  }
-  if (c == '!') {
-    ++cur_;
-    if (startsWith("--")) {
-      cur_ += 2;
-      return parseComment(token);
+  // Loops only for markup declarations, which yield no token. Every other arm
+  // returns on its first pass, so the common path is a straight line.
+  while (true) {
+    if (atEnd()) {
+      return makeError(token, ErrorCode::UnexpectedEndAfterLt);
     }
-    if (startsWith("[CDATA[")) {
-      cur_ += 7;
-      return parseCdata(token);
+    const char c = *cur_;
+    if (c == '/') {
+      ++cur_;
+      return parseElementClose(token);
     }
-    skipBangDecl();
-    return nextFromSource(token);
+    if (c == '!') {
+      ++cur_;
+      if (startsWith("--")) {
+        cur_ += 2;
+        return parseComment(token);
+      }
+      if (startsWith("[CDATA[")) {
+        cur_ += 7;
+        return parseCdata(token);
+      }
+      // A markup declaration produces no token. Resume scanning here rather
+      // than re-entering nextFromSource: that spent one stack frame per
+      // declaration, and nothing bounds how many a document may carry --
+      // MAX_DEPTH guards element nesting, not sibling markup.
+      skipBangDecl();
+      if (error() || atEnd()) {
+        return false;
+      }
+      if (*cur_ != '<') {
+        return scanText(token);
+      }
+      ++cur_;
+      continue;
+    }
+    if (c == '?') {
+      ++cur_;
+      return parsePi(token);
+    }
+    if (detail::isNameStart(c)) {
+      return parseElementOpen(token);
+    }
+    return makeError(token, ErrorCode::UnexpectedCharAfterLt);
   }
-  if (c == '?') {
-    ++cur_;
-    return parsePi(token);
-  }
-  if (detail::isNameStart(c)) {
-    return parseElementOpen(token);
-  }
-  return makeError(token, ErrorCode::UnexpectedCharAfterLt);
 }
 
 // Scans a start-tag's attribute list into attributes_ up to the closing '>'
@@ -3166,6 +3209,7 @@ inline auto BasicParser<Opts>::parseElementOpen(Token& token) -> bool {
   if (token.name.empty()) {
     return makeError(token, ErrorCode::ExpectedElementName);
   }
+  attr_streamed_ = false;
   attributes_.clear();
   if (!parseAttributes(token.self_closing)) {
     token.type = TokenType::Error;
@@ -3312,6 +3356,11 @@ inline auto BasicParser<Opts>::endElement(std::string_view expected_name) -> boo
 // would let a document already near the limit descend MAX_DEPTH again.
 template<ParserOptions Opts>
 inline auto BasicParser<Opts>::skipElement(const uint16_t start_depth) -> void {
+  // Skipping an element is the one way a start-tag is accepted without a
+  // matching pull(), which is what would otherwise consume a streamed
+  // attribute capture. Dropping it here keeps the values from being applied,
+  // by ordinal, to whichever element reads attributes next.
+  attr_streamed_ = false;
   if (last_self_closing_) {
     return;
   }
@@ -3825,7 +3874,10 @@ class Serializer {
   }
 
   // Writes the items of a list/container, space-separated (XSD xs:list form).
-  template<typename M>
+  // kAttr picks the escaping: a list-valued attribute needs '"' escaped, a list
+  // element needs '>' escaped so an item carrying "]]>" cannot reconstitute the
+  // CDATA-close delimiter in character data and fail a strict re-parse.
+  template<bool kAttr, typename M>
   auto writeListItems(const M& container) -> void {
     bool first = true;
     detail::forEachItem(container, [this, &first](const auto& v) {
@@ -3833,7 +3885,7 @@ class Serializer {
         out_ += ' ';
       }
       first = false;
-      writeScalar<true>(v);
+      writeScalar<kAttr>(v);
     });
   }
 
@@ -3846,7 +3898,7 @@ class Serializer {
         out_ += ' ';
         out_ += f.xml_name;
         out_ += "=\"";
-        writeListItems(obj.*(f.member));
+        writeListItems<true>(obj.*(f.member));
         out_ += '"';
       } else if constexpr (XmlOptional<M>) {
         if (const auto& m = obj.*(f.member)) {  // omit absent optional attrs
@@ -3885,7 +3937,7 @@ class Serializer {
     } else if constexpr (f.kind == FieldKind::List) {
       doIndent(depth);
       openTag(f.xml_name);
-      writeListItems(obj.*(f.member));
+      writeListItems<false>(obj.*(f.member));
       closeTag(f.xml_name);
       doNewline();
     } else if constexpr (f.kind == FieldKind::Variant) {

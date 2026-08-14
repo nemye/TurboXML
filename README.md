@@ -405,6 +405,33 @@ bind to the same field, and `<a:x>…</b:x>` is accepted. `Token::prefix` and
 external entity resolution, and the only entities recognized are the five
 predefined ones — anything else is `ErrorCode::UndefinedEntity`.
 
+**Mixed content.** When a comment, processing instruction, CDATA section, or an
+unmapped child element splits an element's text, a string field keeps only the
+last run — `<desc>Price: <![CDATA[$5]]> only</desc>` yields `" only"`. This
+follows from the zero-copy contract: a `std::string_view` can name one
+contiguous run of the source and no more. Numeric, enum, and custom-value
+fields concatenate the runs before parsing, as do owning `std::string` fields
+under `NormalizingParser` / `StrictParser`; only the raw string path drops. Use
+a normalizing parser with a `std::string` field when an element's text may be
+interrupted.
+
+**Fixed containers.** `arrField` fills a `std::array` sequentially and keeps no
+fill count, so the serializer emits all `N` slots, default-constructed ones
+included. A partially filled fixed container is therefore not a
+serialize/deserialize fixed point; use `vecField` with a `std::vector` when the
+item count has to survive a round trip.
+
+**Optional attributes.** An `std::optional<T>` *attribute* whose value fails to
+parse is left disengaged rather than failing the parse, so a malformed value is
+indistinguishable from an absent attribute. The same member as a child element
+is a hard `ErrorCode::InvalidNumericValue` (or the matching enum/value code).
+Use a non-optional member, or check the source text yourself, where the
+distinction matters.
+
+**`xs:list` items.** Whitespace separates items, so an item cannot itself
+contain whitespace: serializing `{"a b"}` and reading it back yields two items.
+This is inherent to the XSD list form, not a parser choice.
+
 ## Generating from XSD
 
 The `xsdgen` tool turns an XSD schema into the matching `XmlMetadata` definitions,

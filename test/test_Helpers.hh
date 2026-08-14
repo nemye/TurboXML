@@ -1,4 +1,6 @@
 #pragma once
+#include <array>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -318,4 +320,70 @@ struct xmlight::XmlMetadata<MixedRecord> {
   static constexpr auto fields = std::make_tuple(xmlight::attrField("id", &MixedRecord::id),
                                                  xmlight::field("Name", &MixedRecord::name),
                                                  xmlight::arrField("Score", &MixedRecord::scores));
+};
+
+/// A fixed container whose item type carries attributes, so overflowing items
+/// reach the streamed attribute capture and are then skipped. Slot holds the
+/// container alone: with one element field the document-order hint stays on it,
+/// which is what puts repeats on the streamed path.
+struct AttrSlot {
+  std::string_view sid;
+};
+
+template<>
+struct xmlight::XmlMetadata<AttrSlot> {
+  static constexpr auto fields = std::make_tuple(xmlight::attrField("sid", &AttrSlot::sid));
+};
+
+struct SlotGroup {
+  std::array<AttrSlot, 1> slots{};
+};
+
+template<>
+struct xmlight::XmlMetadata<SlotGroup> {
+  static constexpr auto fields = std::make_tuple(xmlight::arrField("Slot", &SlotGroup::slots));
+};
+
+struct SlotSummary {
+  std::string_view label;
+};
+
+template<>
+struct xmlight::XmlMetadata<SlotSummary> {
+  static constexpr auto fields = std::make_tuple(xmlight::attrField("label", &SlotSummary::label));
+};
+
+struct SlotDoc {
+  SlotGroup group{};
+  SlotSummary summary{};
+};
+
+template<>
+struct xmlight::XmlMetadata<SlotDoc> {
+  static constexpr auto fields = std::make_tuple(xmlight::field("Group", &SlotDoc::group),
+                                                 xmlight::field("Summary", &SlotDoc::summary));
+};
+
+/// A required attribute whose name is also a plausible child element name, for
+/// the findFieldIndex collision between attribute and element kinds.
+struct ReqAttrRecord {
+  std::string_view id;
+  std::string_view name;
+};
+
+template<>
+struct xmlight::XmlMetadata<ReqAttrRecord> {
+  static constexpr auto fields = std::make_tuple(xmlight::attrField("id", &ReqAttrRecord::id, true),
+                                                 xmlight::field("Name", &ReqAttrRecord::name));
+};
+
+/// An xs:list of owning strings: the item type that makes list-element
+/// escaping observable (a string item may carry markup bytes; an int cannot).
+struct StringList {
+  std::vector<std::string> tags;
+};
+
+template<>
+struct xmlight::XmlMetadata<StringList> {
+  static constexpr auto fields = std::make_tuple(xmlight::listField("Tags", &StringList::tags));
 };
