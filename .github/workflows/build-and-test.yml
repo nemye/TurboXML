@@ -1,0 +1,71 @@
+name: Build and Test
+
+on:
+  push:
+    branches:
+      - "**"
+
+  pull_request:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+jobs:
+
+  build-and-test:
+    name: ${{ matrix.compiler }} ${{ matrix.build_type }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+        build_type: [Debug, Release]
+        include:
+          - compiler: gcc
+            cc: gcc
+            cxx: g++
+          - compiler: clang
+            cc: clang
+            cxx: clang++
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            ${{ matrix.compiler }}
+
+      # Release keeps the shipped defaults (unity + LTO ON) so the configuration
+      # users actually build is the one under test.
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          cmake \
+            -S . \
+            -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DLIGHTNINGXML_BUILD_TESTS=ON \
+            -DLIGHTNINGXML_BUILD_BENCHMARKS=OFF \
+            -DLIGHTNINGXML_BUILD_CODEGEN=ON
+
+      - name: Build
+        run: |
+          cmake --build build --parallel
+
+      - name: Run tests
+        run: |
+          ctest \
+            --test-dir build \
+            --output-on-failure \
+            --parallel

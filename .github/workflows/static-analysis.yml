@@ -40,12 +40,18 @@ jobs:
             -DLIGHTNINGXML_BUILD_BENCHMARKS=OFF \
             -DLIGHTNINGXML_BUILD_TESTS=ON \
             -DLIGHTNINGXML_BUILD_CODEGEN=ON \
+            -DLIGHTNINGXML_ENABLE_UNITY_BUILD=OFF \
+            -DLIGHTNINGXML_ENABLE_LTO=OFF \
             -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
       - name: Build test targets
         run: |
           cmake --build build
 
+      # Unity builds are disabled above on purpose: with them on, the only
+      # entries in compile_commands.json are the generated unity sources, so
+      # clang-tidy cannot match the files named here and silently falls back to
+      # a default command that cannot even resolve the include path.
       - name: Run clang-tidy
         run: |
           clang-tidy \
@@ -54,6 +60,57 @@ jobs:
               \( -name "*.cpp" -o -name "*.cc" -o -name "*.cxx" \) \
               ! -path "test/bench_*")
 
+
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build
+
+      - name: Configure fuzz build
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake \
+            -S . \
+            -B build-fuzz \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DLIGHTNINGXML_BUILD_FUZZERS=ON \
+            -DLIGHTNINGXML_BUILD_TESTS=OFF \
+            -DLIGHTNINGXML_BUILD_BENCHMARKS=OFF \
+            -DLIGHTNINGXML_BUILD_CODEGEN=OFF
+
+      - name: Build fuzzer
+        run: |
+          cmake --build build-fuzz --parallel
+
+      # Bounded so this stays a regression gate on PRs rather than a fuzzing
+      # campaign. The seed corpus is committed, so the run always starts from
+      # inputs that reach the interesting paths.
+      #
+      # The scratch directory is listed first on purpose: libFuzzer saves newly
+      # discovered inputs into the first corpus directory and reads the rest,
+      # so this is what keeps test/fuzz_corpus a pristine set of seeds instead
+      # of accumulating generated units.
+      - name: Fuzz
+        run: |
+          mkdir -p "${RUNNER_TEMP}/fuzz-corpus"
+          ./build-fuzz/lightningxml_fuzz \
+            -max_total_time=60 \
+            -max_len=65536 \
+            -print_final_stats=1 \
+            -artifact_prefix="${RUNNER_TEMP}/" \
+            "${RUNNER_TEMP}/fuzz-corpus" \
+            test/fuzz_corpus
 
   sanitizers:
     name: ASAN UBSAN

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(LightningXML
-    VERSION 1.1.0
+    VERSION 1.3.0
     LANGUAGES CXX
     DESCRIPTION "High-performance XML pull-parser for C++20"
 )
@@ -17,6 +17,7 @@ option(LIGHTNINGXML_BUILD_CODEGEN      "Build the XSD -> XmlMetadata code genera
 option(LIGHTNINGXML_WITH_PUGIXML       "Build pugixml comparison benchmarks"                    OFF)
 option(LIGHTNINGXML_WITH_RAPIDXML      "Build RapidXML comparison benchmarks (via Boost)"       OFF)
 option(LIGHTNINGXML_WITH_LIBXML2       "Build libxml2 comparison benchmarks"                    OFF)
+option(LIGHTNINGXML_BUILD_FUZZERS      "Build libFuzzer targets (requires Clang)"               OFF)
 option(LIGHTNINGXML_ENABLE_SANITIZERS  "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(LIGHTNINGXML_ENABLE_COVERAGE    "Enable gcov coverage instrumentation"                   OFF)
 option(LIGHTNINGXML_ENABLE_UNITY_BUILD "Compile executables as unity builds"                    ON)
@@ -137,6 +138,28 @@ if(LIGHTNINGXML_BUILD_TESTS)
     message(STATUS "LightningXML: tests enabled")
 endif()
 
+# ---- Fuzzers ----
+# libFuzzer ships with Clang only. The sanitizers are part of the target rather
+# than LIGHTNINGXML_ENABLE_SANITIZERS because a fuzzer without them reports
+# almost nothing: the crashes worth finding here are reads off the end of a
+# buffer, not assertion failures.
+if(LIGHTNINGXML_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "LIGHTNINGXML_BUILD_FUZZERS requires Clang (libFuzzer)")
+    endif()
+
+    add_executable(lightningxml_fuzz test/fuzz_LightningXML.cc)
+    target_link_libraries(lightningxml_fuzz PRIVATE lightningxml)
+    target_compile_options(lightningxml_fuzz PRIVATE
+        -Wall -Wextra -Wpedantic
+        -fsanitize=fuzzer,address,undefined
+        -fno-omit-frame-pointer
+    )
+    target_link_options(lightningxml_fuzz PRIVATE -fsanitize=fuzzer,address,undefined)
+
+    message(STATUS "LightningXML: fuzzers enabled")
+endif()
+
 # ---- Benchmarks ----
 if(LIGHTNINGXML_BUILD_BENCHMARKS)
     FetchContent_Declare(
@@ -201,6 +224,9 @@ if(LIGHTNINGXML_BUILD_BENCHMARKS)
     add_executable(lightningxml_bench test/bench_LightningXML.cc)
     lightningxml_build_options(lightningxml_bench)
     target_link_libraries(lightningxml_bench PRIVATE lightningxml_helpers benchmark::benchmark)
+    target_compile_options(lightningxml_bench PRIVATE
+        $<$<CXX_COMPILER_ID:GNU,Clang,AppleClang>:-Wall -Wextra -Wpedantic>
+    )
     if(LIGHTNINGXML_WITH_PUGIXML)
         target_link_libraries(lightningxml_bench PRIVATE pugixml::pugixml)
         target_compile_definitions(lightningxml_bench PRIVATE LIGHTNINGXML_HAS_PUGIXML)

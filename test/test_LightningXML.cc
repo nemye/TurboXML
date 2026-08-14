@@ -813,6 +813,149 @@ TEST_F(LightningBasicTests, ElementNameCollidesWithAttrField) {
   EXPECT_EQ(users.items[0].email, "c@c.com");
 }
 
+/// @brief A child element matching an attribute field's name must not count as
+/// that attribute being present.
+///
+/// findFieldIndex spans every named kind, attributes included, so `<id>` binds
+/// to the field index of attrField("id"). Recording presence before dispatching
+/// on the kind let the child element satisfy the required-attribute check while
+/// the member stayed unset.
+TEST_F(LightningBasicTests, ChildElementDoesNotSatisfyRequiredAttribute) {
+  const std::string_view missing = R"(<Record><id>999</id><Name>Collider</Name></Record>)";
+  xmlight::Parser parser{missing};
+  ReqAttrRecord record;
+  EXPECT_FALSE(xmlight::deserialize(parser, "Record", record));
+  EXPECT_EQ(parser.errorCode(), xmlight::ErrorCode::MissingRequiredField);
+
+  // The real attribute still satisfies it, and the colliding child is skipped.
+  const std::string_view present = R"(<Record id="42"><id>999</id><Name>Collider</Name></Record>)";
+  xmlight::Parser ok_parser{present};
+  ReqAttrRecord ok_record;
+  ASSERT_TRUE(xmlight::deserialize(ok_parser, "Record", ok_record));
+  EXPECT_EQ(ok_record.id, "42");
+  EXPECT_EQ(ok_record.name, "Collider");
+}
+
+/// @brief Streamed attribute values must not survive the element they were
+/// captured from.
+///
+/// A start-tag whose target type qualifies for streamed capture stores its raw
+/// values in attr_vals_ by ordinal. An item past a fixed container's capacity
+/// is skipped rather than pulled, so nothing consumed that state; the next
+/// element to read attributes by ordinal then picked up the skipped element's
+/// values, even with no attributes of its own and a different attribute name.
+TEST_F(LightningBasicTests, StreamedAttrsDoNotLeakPastFixedContainerOverflow) {
+  const std::string_view overflow =
+      R"(<Doc><Group><Slot sid="A"/><Slot sid="B"/></Group><Summary/></Doc>)";
+  xmlight::Parser parser{overflow};
+  SlotDoc doc;
+  ASSERT_TRUE(xmlight::deserialize(parser, "Doc", doc));
+  EXPECT_EQ(doc.group.slots[0].sid, "A");
+  EXPECT_EQ(doc.summary.label, "");
+
+  // The element that does carry the attribute still gets it.
+  const std::string_view labelled =
+      R"(<Doc><Group><Slot sid="A"/><Slot sid="B"/></Group><Summary label="S"/></Doc>)";
+  xmlight::Parser labelled_parser{labelled};
+  SlotDoc labelled_doc;
+  ASSERT_TRUE(xmlight::deserialize(labelled_parser, "Doc", labelled_doc));
+  EXPECT_EQ(labelled_doc.group.slots[0].sid, "A");
+  EXPECT_EQ(labelled_doc.summary.label, "S");
+}
+
+/// @brief A long run of markup declarations must cost no stack.
+///
+/// A '<!' that is neither a comment nor CDATA is skipped and produces no token.
+/// Resuming by re-entering the tokenizer spent one stack frame per declaration,
+/// which MAX_DEPTH does not bound - it guards element nesting, not sibling
+/// markup - so a few hundred KB of "<!>" exhausted the stack on any build that
+/// did not happen to eliminate the tail call.
+TEST_F(LightningBasicTests, MarkupDeclarationRunDoesNotRecurse) {
+  static constexpr size_t kDeclarations = 200000;
+  std::string decls;
+  decls.reserve(kDeclarations * 3);
+  for (size_t i = 0; i < kDeclarations; ++i) {
+    decls += "<!>";
+  }
+
+  const std::string prolog = decls + R"(<Record id="42"><Name>Deep</Name></Record>)";
+  xmlight::Parser prolog_parser{prolog};
+  ReqAttrRecord from_prolog;
+  ASSERT_TRUE(xmlight::deserialize(prolog_parser, "Record", from_prolog));
+  EXPECT_EQ(from_prolog.name, "Deep");
+
+  const std::string content = R"(<Record id="42">)" + decls + R"(<Name>Deep</Name></Record>)";
+  xmlight::Parser content_parser{content};
+  ReqAttrRecord from_content;
+  ASSERT_TRUE(xmlight::deserialize(content_parser, "Record", from_content));
+  EXPECT_EQ(from_content.name, "Deep");
+}
+
+/// @brief An xs:list element's items are escaped as character data, not as an
+/// attribute value.
+///
+/// Attribute escaping leaves '>' alone, which is legal in an attribute but lets
+/// an item spelling "]]>" reconstitute the CDATA-close delimiter once written
+/// into element text - output the serializer produced but a strict parser then
+/// rejected.
+TEST_F(LightningBasicTests, ListElementItemsEscapeAsCharacterData) {
+  StringList list;
+  list.tags.emplace_back("a]]>b");
+  list.tags.emplace_back("x<y&z");
+
+  const std::string xml = xmlight::serialize<false>("Root", list);
+  EXPECT_EQ(xml, "<Root><Tags>a]]&gt;b x&lt;y&amp;z</Tags></Root>");
+
+  xmlight::StrictParser parser{xml};
+  StringList round_tripped;
+  ASSERT_TRUE(xmlight::deserialize(parser, "Root", round_tripped));
+  EXPECT_EQ(round_tripped.tags, list.tags);
+}
+
+/// @brief Field dispatch must confirm the name after the hash matches.
+///
+/// allNamesUnique<T>() only proves the declared names do not alias each other;
+/// it says nothing about a document name colliding with a declared one. FNV-1a
+/// is invertible, so such a collision is constructible rather than improbable,
+/// and binding on the hash alone would let a chosen name reach a field it does
+/// not name. Constructing a real 64-bit collision does not belong in a unit
+/// test, so the guard is driven directly with the hash of a declared field
+/// paired with a name that is not it - exactly the state a collision produces.
+TEST_F(LightningBasicTests, FieldDispatchVerifiesNameAfterHashMatch) {
+  constexpr size_t no_match = xmlight::detail::FIELD_COUNT<User>;
+  constexpr xmlight::FieldHash name_hash = xmlight::detail::hashFieldName("Name");
+
+  EXPECT_LT(xmlight::detail::findFieldIndex<User>(name_hash, "Name"), no_match);
+  EXPECT_EQ(xmlight::detail::findFieldIndex<User>(name_hash, "Collider"), no_match);
+  // A prefix of the real name must not slip through either.
+  EXPECT_EQ(xmlight::detail::findFieldIndex<User>(name_hash, "Nam"), no_match);
+}
+
+/// @brief The attribute path applies the same post-hash name check. Its
+/// rejection branch needs a real hash collision to reach, so what is pinned
+/// here is that the check does not disturb the shapes that legitimately reach
+/// it: an attribute matched out of declaration order (the full-scan arm) and a
+/// prefixed attribute, whose local name is what both the hash and the compare
+/// are taken from.
+TEST_F(LightningBasicTests, AttributeNameCheckPreservesMatching) {
+  {
+    xmlight::Parser parser{std::string_view(R"(<I s5="e" a3="3" s1="a" a1="1"/>)")};
+    AttrItem item;
+    ASSERT_TRUE(xmlight::deserialize(parser, "I", item));
+    EXPECT_EQ(item.a1, 1);
+    EXPECT_EQ(item.a3, 3);
+    EXPECT_EQ(item.s1, "a");
+    EXPECT_EQ(item.s5, "e");
+  }
+  {
+    xmlight::Parser parser{std::string_view(R"(<M ns:id="7" role="r"/>)")};
+    OrgMember member;
+    ASSERT_TRUE(xmlight::deserialize(parser, "M", member));
+    EXPECT_EQ(member.id, 7);
+    EXPECT_EQ(member.role, "r");
+  }
+}
+
 /// @brief Vectors of string primitives: empty container, multiple values, and
 /// a self-closing element yielding an empty string_view.
 TEST_F(LightningBasicTests, VecOfPrimitivesForms) {
@@ -1755,7 +1898,7 @@ TEST_F(LightningBasicTests, StrictCharDataValidationFused) {
   const std::string fourteen(14, 'a');
   const std::string fifteen(15, 'a');
   const std::string sixteen(16, 'a');
-  const auto REJECT = std::to_array<std::pair<std::string, xmlight::ErrorCode>>({
+  const auto reject = std::to_array<std::pair<std::string, xmlight::ErrorCode>>({
       // "]]" ends the first 16-byte chunk, '>' opens the next.
       {fourteen + "]]>", xmlight::ErrorCode::CDataEndInContent},
       // "]]>" split ']' / "]>" across the chunk boundary.
@@ -1768,7 +1911,7 @@ TEST_F(LightningBasicTests, StrictCharDataValidationFused) {
       // Short run: byte-loop tail only.
       {std::string("b\x01d"), xmlight::ErrorCode::ForbiddenControlChar},
   });
-  for (const auto& [text, want] : REJECT) {
+  for (const auto& [text, want] : reject) {
     const std::string xml = "<NormText><v>" + text + "</v></NormText>";
     xmlight::StrictParser p{xml};
     NormText t;
@@ -1785,13 +1928,13 @@ TEST_F(LightningBasicTests, StrictCharDataValidationFused) {
   for (int i = 0; i < 20; ++i) {
     dense += "]x";
   }
-  const auto ACCEPT = std::to_array<std::string>({
+  const auto accept = std::to_array<std::string>({
       sixteen + "]",   // ']' as the final byte after a clean chunk
       fifteen + "]]",  // "]]" with no '>' at the very end
       dense,           // ']'-dense long run: one containsCdataEnd resolution
       "a\tb\nc",       // legal whitespace controls
   });
-  for (const auto& text : ACCEPT) {
+  for (const auto& text : accept) {
     const std::string xml = "<NormText><v>" + text + "</v></NormText>";
     xmlight::StrictParser p{xml};
     NormText t;
@@ -2624,6 +2767,30 @@ TEST_F(LightningBasicTests, DateTimeLexicalRejects) {
   }
 }
 
+/// @brief A day past its month's length is not a date.
+///
+/// Bounding the day at 31 alone accepted February 31st, which chrono then rolls
+/// silently into March: toSysDays() handed back an instant the document never
+/// named. The year is bounded to std::chrono::year's range for the same reason
+/// - Date cannot represent anything wider, so a larger one only reads back
+/// wrong.
+TEST_F(LightningBasicTests, DateRejectsImpossibleCalendarDays) {
+  xmlight::Date d{};
+  for (const std::string_view bad :
+       {"2026-02-31", "2026-02-30", "2026-04-31", "2026-06-31", "2026-09-31", "2026-11-31",
+        "2025-02-29", "1900-02-29", "0000123456-01-01", "0000032768-01-01"}) {
+    EXPECT_FALSE(xmlight::XmlValueTraits<xmlight::Date>::parse(bad, d)) << bad;
+  }
+  for (const std::string_view good :
+       {"2026-01-31", "2026-02-28", "2024-02-29", "2000-02-29", "0000032767-12-31"}) {
+    EXPECT_TRUE(xmlight::XmlValueTraits<xmlight::Date>::parse(good, d)) << good;
+  }
+  // The same check reaches through dateTime, whose date half shares the cursor.
+  xmlight::DateTime dt{};
+  EXPECT_FALSE(xmlight::XmlValueTraits<xmlight::DateTime>::parse("2026-02-31T00:00:00", dt));
+  EXPECT_TRUE(xmlight::XmlValueTraits<xmlight::DateTime>::parse("2024-02-29T00:00:00", dt));
+}
+
 /// @brief Lexical edge forms: negative years round-trip with the sign and
 /// zero padding, fractions truncate past nanoseconds, negative timezones
 /// round-trip, and a dateTime without a timezone converts as UTC.
@@ -2684,6 +2851,29 @@ TEST_F(LightningBasicTests, SerializerEscaping) {
                        R"("><Name>)" + std::string(40, 'A') + "&lt;mid&gt;" + std::string(40, 'B') +
                        "</Name></U>");
   }
+}
+
+/// Whitespace inside a string field must survive serialize() -> deserialize().
+/// A conforming reader rewrites literal whitespace on the way back in
+/// (attribute-value normalization folds tab/LF/CR to a space, EOL
+/// normalization folds CR to LF), so the serializer has to emit it as numeric
+/// character references or the bytes are silently lost on the round trip.
+TEST_F(LightningBasicTests, SerializerEscapesWhitespaceForRoundTrip) {
+  OwnedUser user;
+  user.id = 7;
+  user.role = "a\tb\nc\rd";
+  user.name = "e\tf\ng\rh";
+  const std::string xml = xmlight::serialize<false>("U", user);
+
+  EXPECT_NE(xml.find(R"(role="a&#9;b&#10;c&#13;d")"), std::string::npos);
+  // Tab and LF are preserved literally in content; only CR is normalized away.
+  EXPECT_NE(xml.find("<Name>e\tf\ng&#13;h</Name>"), std::string::npos);
+
+  xmlight::StrictParser parser{xml};
+  OwnedUser out;
+  ASSERT_TRUE(xmlight::deserialize(parser, "U", out));
+  EXPECT_EQ(out.role, user.role);
+  EXPECT_EQ(out.name, user.name);
 }
 
 TEST_F(LightningBasicTests, SerializerLongTagNameRoundTrip) {
