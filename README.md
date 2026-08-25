@@ -462,6 +462,12 @@ Supported XSD constructs:
 
 Unsupported constructs are reported as notes on `stderr` rather than causing a failure; the generator produces the best output it can for the rest of the schema.
 
+**Renamed identifiers.** Three schema spellings cannot be used verbatim in C++, so the member or enumerator takes a trailing `_` while the XML name in the metadata stays exactly as the schema wrote it:
+
+- a member whose name matches the struct declaring it, or matches its own type's name (`struct Antenna { AntennaTypeEnum Antenna_; }`);
+- an enumerator or member spelled like a macro from the C standard headers or GoogleTest (`SIGINT`, `NULL`, `TEST`, `FAIL`, …), which would otherwise be macro-expanded at the point of use;
+- a member that hides a type name makes the members after it use the elaborated form (`struct Report data;`) rather than being renamed.
+
 **Not supported (out of scope):**
 - `xs:union` - no C++ type mapping without boxing
 - `xs:import` - cross-namespace schema merging requires a resolver not in scope
@@ -469,7 +475,21 @@ Unsupported constructs are reported as notes on `stderr` rather than causing a f
 - `xs:any` / `xs:anyAttribute` - wildcards have no static type
 - External entity resolution - requires file I/O, incompatible with the zero-copy design
 
+Pattern facets are checked with `std::regex` in ECMAScript syntax. XSD-only regex constructs (`\i`, `\c`, `\p{…}`, character-class subtraction) have no ECMAScript equivalent, so those patterns are reported and left unenforced rather than compiled into a different rule.
+
 Built with `LIGHTNINGXML_BUILD_CODEGEN` (on by default).
+
+### OMS UCI Schema Add-On
+
+An optional add-on generates the complete [OMS UCI v2.5](https://github.com/open-arsenal/uci) message set - 722 messages, 4,612 types, 725 enums - and tests it against hand-written UCI documents. The schema is fetched at configure time from a pinned commit and SHA256-checked; nothing is vendored.
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLIGHTNINGXML_WITH_UCI=ON
+cmake --build build --target lightningxml_uci_tests
+ctest --test-dir build -R Uci
+```
+
+See [extras/uci/README.md](extras/uci/README.md) for provenance, build cost, offline builds, and the schema's known gaps.
 
 ### Constraint Validation
 
@@ -517,6 +537,8 @@ Copy `include/LightningXML.hh` into your project. No build step required.
 | `LIGHTNINGXML_WITH_RAPIDXML` | `OFF` | Build RapidXML comparison benchmarks (fetches Boost, uses its bundled RapidXML) |
 | `LIGHTNINGXML_WITH_LIBXML2` | `OFF` | Build libxml2 comparison benchmarks (fetches libxml2 if not found) |
 | `LIGHTNINGXML_BUILD_FUZZERS` | `OFF` | Build the libFuzzer target (requires Clang) |
+| `LIGHTNINGXML_WITH_UCI` | `OFF` | Build the OMS UCI v2.5 add-on (fetches the schema, generates and tests it) |
+| `LIGHTNINGXML_UCI_SCHEMA_DIR` | *(empty)* | Directory holding the UCI v2.5 XSDs; skips the download |
 | `LIGHTNINGXML_ENABLE_SANITIZERS` | `OFF` | Enable AddressSanitizer and UndefinedBehaviorSanitizer |
 | `LIGHTNINGXML_ENABLE_COVERAGE` | `OFF` | Enable gcov coverage instrumentation (forces unity and LTO off) |
 | `LIGHTNINGXML_ENABLE_UNITY_BUILD` | `ON` | Compile executables as unity builds |
@@ -569,6 +591,8 @@ target_link_libraries(my_target PRIVATE LightningXML::lightningxml)
 ├── clean.sh
 ├── include/
 │   └── LightningXML.hh
+├── extras/
+│   └── uci/                 # optional OMS UCI v2.5 add-on (schema fetch + tests)
 ├── tools/
 │   ├── XSDCodegen.hh        # XSD -> XmlMetadata generator (library)
 │   └── XSDGen.cc            # CLI front-end

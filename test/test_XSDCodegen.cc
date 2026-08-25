@@ -602,7 +602,7 @@ TEST(XsdCodegen, InlineTypeInGroupDef) {
   const auto r = xsd::generate(xsd);
   ASSERT_TRUE(r.ok);
   EXPECT_TRUE(has(r.code, "struct Audit {")) << r.code;
-  EXPECT_TRUE(has(r.code, "Audit audit{};")) << r.code;
+  EXPECT_TRUE(has(r.code, "Audit audit;")) << r.code;
   EXPECT_TRUE(has(r.code, "xmlight::XmlMetadata<Audit>")) << r.code;
 }
 
@@ -701,7 +701,7 @@ TEST(XsdCodegen, NestedIncludesResolved) {
   const auto r = xsd::generate(root_xsd, opts);
   ASSERT_TRUE(r.ok);
   EXPECT_TRUE(has(r.code, "struct Leaf {")) << r.code;
-  EXPECT_TRUE(has(r.code, "Leaf leaf{};")) << r.code;
+  EXPECT_TRUE(has(r.code, "Leaf leaf;")) << r.code;
 }
 
 // A top-level xs:element emits a root-deserialize comment in the output.
@@ -737,4 +737,241 @@ TEST(XsdCodegen, SimpleContentConstraint) {
   ASSERT_TRUE(r.ok);
   EXPECT_TRUE(has(r.code, "XmlConstraints<Amount>")) << r.code;
   EXPECT_TRUE(has(r.code, "v.value < 0")) << r.code;
+}
+
+// A struct reached first as another type's member must still be emitted after
+// the base it extends, whatever order the schema declares them in.
+TEST(XsdCodegen, BaseIsDefinedBeforeDerived) {
+  const std::string_view xsd = R"(<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:complexType name="Holder">
+      <xs:sequence>
+        <xs:element name="child" type="Derived"/>
+      </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="Derived">
+      <xs:complexContent>
+        <xs:extension base="Base">
+          <xs:sequence><xs:element name="extra" type="xs:string"/></xs:sequence>
+        </xs:extension>
+      </xs:complexContent>
+    </xs:complexType>
+    <xs:complexType name="Base">
+      <xs:sequence><xs:element name="id" type="xs:string"/></xs:sequence>
+    </xs:complexType>
+  </xs:schema>)";
+  const auto r = xsd::generate(xsd);
+  ASSERT_TRUE(r.ok);
+  EXPECT_LT(r.code.find("struct Base {"), r.code.find("struct Derived : Base {")) << r.code;
+}
+
+// std::variant instantiates every alternative, so branch structs have to be
+// complete where the variant member is declared.
+TEST(XsdCodegen, ChoiceBranchTypesAreDefinedBeforeTheVariant) {
+  const std::string_view xsd = R"(<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:complexType name="Holder">
+      <xs:choice>
+        <xs:element name="alpha" type="Alpha"/>
+        <xs:element name="beta" type="Beta"/>
+      </xs:choice>
+    </xs:complexType>
+    <xs:complexType name="Alpha">
+      <xs:sequence><xs:element name="a" type="xs:string"/></xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="Beta">
+      <xs:sequence><xs:element name="b" type="xs:string"/></xs:sequence>
+    </xs:complexType>
+  </xs:schema>)";
+  const auto r = xsd::generate(xsd);
+  ASSERT_TRUE(r.ok);
+  const size_t holder = r.code.find("struct Holder {");
+  EXPECT_LT(r.code.find("struct Alpha {"), holder) << r.code;
+  EXPECT_LT(r.code.find("struct Beta {"), holder) << r.code;
+}
+
+// A repeated choice is held in a vector, which does not relax the requirement.
+TEST(XsdCodegen, RepeatedChoiceBranchTypesAreDefinedBeforeTheVariant) {
+  const std::string_view xsd = R"(<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:complexType name="Holder">
+      <xs:choice maxOccurs="unbounded">
+        <xs:element name="alpha" type="Alpha"/>
+        <xs:element name="count" type="xs:int"/>
+      </xs:choice>
+    </xs:complexType>
+    <xs:complexType name="Alpha">
+      <xs:sequence><xs:element name="a" type="xs:string"/></xs:sequence>
+    </xs:complexType>
+  </xs:schema>)";
+  const auto r = xsd::generate(xsd);
+  ASSERT_TRUE(r.ok);
+  EXPECT_LT(r.code.find("struct Alpha {"), r.code.find("struct Holder {")) << r.code;
+}
+
+// A data member may not repeat the name of its own struct.
+TEST(XsdCodegen, MemberNamedLikeItsStructIsRenamed) {
+  const std::string_view xsd = R"(<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:complexType name="Antenna">
+      <xs:sequence>
+        <xs:element name="Antenna" type="xs:string"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:schema>)";
+  const auto r = xsd::generate(xsd);
+  ASSERT_TRUE(r.ok);
+  EXPECT_TRUE(has(r.code, "std::string Antenna_{};")) << r.code;
+  EXPECT_TRUE(has(r.code, R"(xmlight::field("Antenna", &Antenna::Antenna_, true))")) << r.code;
+}
+
+// A member name hides a same-named type for the members declared after it.
+TEST(XsdCodegen, MemberHidingATypeUsesTheElaboratedForm) {
+  const std::string_view xsd = R"(<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:complexType name="Holder">
+      <xs:sequence>
+        <xs:element name="Report" type="xs:string"/>
+        <xs:element name="data" type="Report"/>
+        <xs:element name="more" type="Report" maxOccurs="unbounded"/>
+      </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="Report">
+      <xs:sequence><xs:element name="text" type="xs:string"/></xs:sequence>
+    </xs:complexType>
+  </xs:schema>)";
+  const auto r = xsd::generate(xsd);
+  ASSERT_TRUE(r.ok);
+  EXPECT_TRUE(has(r.code, "struct Report data;")) << r.code;
+  EXPECT_TRUE(has(r.code, "std::vector<struct Report> more;")) << r.code;
+}
+
+// Value-initializing a struct member would instantiate its destructor, which a
+// member vector of a type defined further down the header cannot satisfy.
+TEST(XsdCodegen, StructMembersCarryNoInitializer) {
+  const std::string_view xsd = R"(<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:complexType name="Outer">
+      <xs:sequence>
+        <xs:element name="inner" type="Inner"/>
+        <xs:element name="count" type="xs:int"/>
+      </xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="Inner">
+      <xs:sequence><xs:element name="later" type="Later" maxOccurs="unbounded"/></xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="Later">
+      <xs:sequence><xs:element name="v" type="xs:string"/></xs:sequence>
+    </xs:complexType>
+  </xs:schema>)";
+  const auto r = xsd::generate(xsd);
+  ASSERT_TRUE(r.ok);
+  EXPECT_TRUE(has(r.code, "Inner inner;")) << r.code;
+  EXPECT_FALSE(has(r.code, "Inner inner{};")) << r.code;
+  EXPECT_TRUE(has(r.code, "int count{};")) << r.code;
+}
+
+// An enumerator or member spelled like a C macro is renamed; the XML token in
+// the enum table keeps the schema's spelling.
+TEST(XsdCodegen, IdentifiersCollidingWithMacrosAreRenamed) {
+  const std::string_view xsd = R"(<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:simpleType name="Discipline">
+      <xs:restriction base="xs:string">
+        <xs:enumeration value="SIGINT"/>
+        <xs:enumeration value="RADAR"/>
+      </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="Report">
+      <xs:sequence>
+        <xs:element name="NULL" type="xs:string"/>
+        <xs:element name="kind" type="Discipline"/>
+      </xs:sequence>
+    </xs:complexType>
+  </xs:schema>)";
+  const auto r = xsd::generate(xsd);
+  ASSERT_TRUE(r.ok);
+  EXPECT_TRUE(has(r.code, "  SIGINT_,")) << r.code;
+  EXPECT_TRUE(has(r.code, R"({"SIGINT", Discipline::SIGINT_})")) << r.code;
+  EXPECT_TRUE(has(r.code, "  RADAR,")) << r.code;
+  EXPECT_TRUE(has(r.code, "std::string NULL_{};")) << r.code;
+  EXPECT_TRUE(has(r.code, R"(xmlight::field("NULL", &Report::NULL_, true))")) << r.code;
+}
+
+// Facet values carry character references; the schema is read with a
+// normalizing parser so the pattern is the text the schema means.
+TEST(XsdCodegen, CharacterReferencesInFacetsAreExpanded) {
+  const std::string_view xsd = R"(<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:simpleType name="Printable">
+      <xs:restriction base="xs:string">
+        <xs:pattern value="[&#x20;-&#x7E;]{1,32}"/>
+      </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="Label">
+      <xs:sequence><xs:element name="text" type="Printable"/></xs:sequence>
+    </xs:complexType>
+  </xs:schema>)";
+  const auto r = xsd::generate(xsd);
+  ASSERT_TRUE(r.ok);
+  EXPECT_TRUE(has(r.code, R"(std::regex pat("[ -~]{1,32}"))")) << r.code;
+}
+
+// XSD regex syntax that std::regex would read as something else is reported
+// instead of being enforced as a different rule.
+TEST(XsdCodegen, XsdOnlyRegexSyntaxIsNotEnforced) {
+  const std::string_view xsd = R"(<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:simpleType name="NameLike">
+      <xs:restriction base="xs:string">
+        <xs:pattern value="\i\c*"/>
+      </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="Tag">
+      <xs:sequence><xs:element name="id" type="NameLike"/></xs:sequence>
+    </xs:complexType>
+  </xs:schema>)";
+  const auto r = xsd::generate(xsd);
+  ASSERT_TRUE(r.ok);
+  EXPECT_FALSE(has(r.code, "std::regex")) << r.code;
+  ASSERT_FALSE(r.notes.empty());
+  EXPECT_NE(r.notes.front().find("XSD-only regex syntax"), std::string::npos) << r.notes.front();
+}
+
+// A hyphen before a character class is an ordinary literal, not the class
+// subtraction that XSD-only syntax uses.
+TEST(XsdCodegen, HyphenBeforeACharacterClassStaysEnforced) {
+  const std::string_view xsd = R"(<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:simpleType name="PartNumber">
+      <xs:restriction base="xs:string">
+        <xs:pattern value="[A-Z0-9]{2}-[0-9]{4}"/>
+      </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="Part">
+      <xs:sequence><xs:element name="pn" type="PartNumber"/></xs:sequence>
+    </xs:complexType>
+  </xs:schema>)";
+  const auto r = xsd::generate(xsd);
+  ASSERT_TRUE(r.ok);
+  EXPECT_TRUE(r.notes.empty()) << r.notes.front();
+  EXPECT_TRUE(has(r.code, R"(std::regex pat("[A-Z0-9]{2}-[0-9]{4}"))")) << r.code;
+}
+
+// XmlConstraints is chosen by the static type, so a derived struct repeats the
+// facet checks its base declares.
+TEST(XsdCodegen, DerivedTypeCarriesInheritedFacetChecks) {
+  const std::string_view xsd = R"(<xs:schema xmlns:xs="http://www.w3.org/2001/XMLSchema">
+    <xs:simpleType name="Code">
+      <xs:restriction base="xs:string">
+        <xs:length value="4"/>
+      </xs:restriction>
+    </xs:simpleType>
+    <xs:complexType name="Base">
+      <xs:sequence><xs:element name="code" type="Code"/></xs:sequence>
+    </xs:complexType>
+    <xs:complexType name="Derived">
+      <xs:complexContent>
+        <xs:extension base="Base">
+          <xs:sequence><xs:element name="note" type="xs:string"/></xs:sequence>
+        </xs:extension>
+      </xs:complexContent>
+    </xs:complexType>
+  </xs:schema>)";
+  const auto r = xsd::generate(xsd);
+  ASSERT_TRUE(r.ok);
+  EXPECT_TRUE(has(r.code, "XmlConstraints<Base>")) << r.code;
+  const size_t derived_at = r.code.find("XmlConstraints<Derived>");
+  ASSERT_NE(derived_at, std::string::npos) << r.code;
+  EXPECT_NE(r.code.find("v.code.size() != 4", derived_at), std::string::npos) << r.code;
 }

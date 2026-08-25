@@ -320,6 +320,26 @@ inline auto isIdentChar(char c) -> bool {
   return isIdentStart(c) || (c >= '0' && c <= '9');
 }
 
+// Identifiers that the C standard headers (and GoogleTest, which generated
+// headers routinely meet in a test translation unit) define as macros. An
+// enumerator or member spelled this way is macro-expanded wherever those
+// headers came first, so it takes a trailing '_'. Only the C++ spelling
+// changes: the XML name in the metadata and enum tables is untouched. Extend
+// the list for a toolchain that defines more (windows.h adds ERROR, DELETE,
+// TRUE, min, max, ...).
+inline auto isMacroName(std::string_view name) -> bool {
+  static const std::unordered_set<std::string_view> k_macro_names = {
+      "SIGABRT", "SIGALRM",  "SIGBUS",   "SIGCHLD",        "SIGCONT",   "SIGFPE",   "SIGHUP",
+      "SIGILL",  "SIGINT",   "SIGIO",    "SIGKILL",        "SIGPIPE",   "SIGPROF",  "SIGQUIT",
+      "SIGSEGV", "SIGSTOP",  "SIGSYS",   "SIGTERM",        "SIGTRAP",   "SIGTSTP",  "SIGTTIN",
+      "SIGTTOU", "SIGURG",   "SIGUSR1",  "SIGUSR2",        "SIGVTALRM", "SIGWINCH", "SIGXCPU",
+      "SIGXFSZ", "EOF",      "NULL",     "BUFSIZ",         "SEEK_SET",  "SEEK_CUR", "SEEK_END",
+      "stdin",   "stdout",   "stderr",   "errno",          "EDOM",      "ERANGE",   "EILSEQ",
+      "NAN",     "INFINITY", "HUGE_VAL", "CLOCKS_PER_SEC", "assert",    "offsetof", "TEST",
+      "FAIL",    "SUCCEED"};
+  return k_macro_names.contains(name);
+}
+
 // Turn an XML name into a valid C++ identifier (invalid chars -> '_').
 inline auto sanitize(std::string_view name) -> std::string {
   std::string out;
@@ -329,6 +349,9 @@ inline auto sanitize(std::string_view name) -> std::string {
   }
   if (out.empty() || !isIdentStart(out.front())) {
     out.insert(out.begin(), '_');
+  }
+  if (isMacroName(out)) {
+    out.push_back('_');
   }
   return out;
 }
@@ -419,8 +442,22 @@ class Generator {
  private:
   struct FieldOut {
     std::string member;    // C++ member declaration, e.g. "std::string name;"
+    std::string name;      // the member identifier the declaration introduces
     std::string metadata;  // metadata call, e.g. xmlight::field("name", &T::name)
     bool inherited{};      // from a base class; omit from struct body but keep in metadata
+    // Struct types this member needs complete at its point of declaration: a
+    // by-value or optional element type, or a variant alternative. Vector and
+    // unique_ptr members hold an incomplete type happily and record nothing.
+    std::vector<std::string> deps{};
+  };
+
+  // The two struct names a field is emitted against. `ptr` names the type the
+  // metadata takes a pointer-to-member of, which for an inherited field is the
+  // derived struct; `owner` is the struct that declares the member, and is what
+  // the member name must not collide with.
+  struct FieldCtx {
+    std::string ptr;
+    std::string owner;
   };
   struct StructDef {
     std::string cpp_name;
@@ -508,6 +545,7 @@ class Generator {
       e.tokens.push_back(en.value);
     }
     enums_.push_back(std::move(e));
+    enum_names_.insert(cpp);
     return cpp;
   }
 
@@ -714,10 +752,21 @@ class Generator {
 
   // field generation
 
-  auto addAttrField(const std::string& ctx, const Attribute& a,
-                    std::vector<FieldOut>& out) -> void {
+  // A data member may repeat neither the name of the struct declaring it nor
+  // the name of its own type: both change what that name means inside the
+  // class. The XML name stays in the metadata; the member takes a trailing '_'.
+  static auto memberName(const FieldCtx& ctx, std::string_view xml_name,
+                         std::string_view type) -> std::string {
+    std::string mem = detail::sanitize(xml_name);
+    if (mem == ctx.owner || mem == type) {
+      mem += '_';
+    }
+    return mem;
+  }
+
+  auto addAttrField(const FieldCtx& ctx, const Attribute& a, std::vector<FieldOut>& out) -> void {
     const Resolved r = resolveAttrType(a);
-    const std::string mem = detail::sanitize(a.name);
+    const std::string mem = memberName(ctx, a.name, r.cpp);
     const std::string suffix = (a.use == "required") ? ", true)" : ")";
     std::string decl;
     const std::string& init_val = !a.fixed.empty() ? a.fixed : a.default_;
@@ -738,55 +787,83 @@ class Generator {
     } else {
       decl = r.cpp + " " + mem + "{};";
     }
-    out.push_back({decl, "xmlight::attrField(\"" + a.name + "\", &" + ctx + "::" + mem + suffix});
+    out.push_back(
+        {.member = decl,
+         .name = mem,
+         .metadata = "xmlight::attrField(\"" + a.name + "\", &" + ctx.ptr + "::" + mem + suffix});
   }
 
-  auto addElementField(const std::string& ctx, const Element& el,
-                       std::vector<FieldOut>& out) -> void {
+  auto addElementField(const FieldCtx& ctx, const Element& el, std::vector<FieldOut>& out) -> void {
     const Resolved r = resolveElementType(el);
-    const std::string mem = detail::sanitize(el.name);
+    const std::string mem = memberName(ctx, el.name, r.cpp);
     const std::string cpp = r.cpp;
     if (r.is_list) {
       if (isUnbounded(el)) {
         note("repeated xs:list element '" + el.name +
              "' (maxOccurs>1) is unsupported; treated as a single list");
       }
-      out.push_back({"std::vector<" + cpp + "> " + mem + ";",
-                     "xmlight::listField(\"" + el.name + "\", &" + ctx + "::" + mem +
-                         (minOccursOf(el) >= 1 ? ", true)" : ")")});
+      out.push_back({.member = "std::vector<" + cpp + "> " + mem + ";",
+                     .name = mem,
+                     .metadata = "xmlight::listField(\"" + el.name + "\", &" + ctx.ptr +
+                                 "::" + mem + (minOccursOf(el) >= 1 ? ", true)" : ")")});
       return;
     }
     if (isUnbounded(el)) {
-      out.push_back({"std::vector<" + cpp + "> " + mem + ";",
-                     "xmlight::vecField(\"" + el.name + "\", &" + ctx + "::" + mem +
-                         (minOccursOf(el) >= 1 ? ", true)" : ")")});
-    } else if (r.is_struct && r.cpp == ctx) {
+      out.push_back({.member = "std::vector<" + cpp + "> " + mem + ";",
+                     .name = mem,
+                     .metadata = "xmlight::vecField(\"" + el.name + "\", &" + ctx.ptr + "::" + mem +
+                                 (minOccursOf(el) >= 1 ? ", true)" : ")")});
+    } else if (r.is_struct && r.cpp == ctx.owner) {
       // Direct self-reference: break the cycle with unique_ptr.
-      out.push_back({"std::unique_ptr<" + cpp + "> " + mem + ";",
-                     "xmlight::field(\"" + el.name + "\", &" + ctx + "::" + mem + ")"});
+      out.push_back(
+          {.member = "std::unique_ptr<" + cpp + "> " + mem + ";",
+           .name = mem,
+           .metadata = "xmlight::field(\"" + el.name + "\", &" + ctx.ptr + "::" + mem + ")"});
     } else if (minOccursOf(el) == 0) {
-      out.push_back({"std::optional<" + cpp + "> " + mem + ";",
-                     "xmlight::field(\"" + el.name + "\", &" + ctx + "::" + mem + ")"});
+      out.push_back(
+          {.member = "std::optional<" + cpp + "> " + mem + ";",
+           .name = mem,
+           .metadata = "xmlight::field(\"" + el.name + "\", &" + ctx.ptr + "::" + mem + ")",
+           .deps = structDep(r)});
     } else {
-      out.push_back({cpp + " " + mem + "{};",
-                     "xmlight::field(\"" + el.name + "\", &" + ctx + "::" + mem + ", true)"});
+      // A struct member is declared without "{}": value-initializing it here
+      // would instantiate its destructor, and a struct holding a vector of a
+      // type defined further down the header cannot supply one yet. Its own
+      // members carry the initializers, so default-construction is unchanged.
+      out.push_back(
+          {.member = cpp + " " + mem + (r.is_struct ? ";" : "{};"),
+           .name = mem,
+           .metadata = "xmlight::field(\"" + el.name + "\", &" + ctx.ptr + "::" + mem + ", true)",
+           .deps = structDep(r)});
     }
   }
 
-  auto addChoiceFields(const std::string& ctx, const Choice& ch,
-                       std::vector<FieldOut>& out) -> void {
+  static auto structDep(const Resolved& r) -> std::vector<std::string> {
+    if (!r.is_struct) {
+      return {};
+    }
+    return {r.cpp};
+  }
+
+  auto addChoiceFields(const FieldCtx& ctx, const Choice& ch, std::vector<FieldOut>& out) -> void {
     std::vector<std::string> types;
     std::vector<std::string> alts;
+    std::vector<std::string> deps;
     std::unordered_set<std::string> seen;
     for (const auto& el : ch.elements) {
       const Resolved r = resolveElementType(el);
       if (!seen.insert(r.cpp).second) {
-        note("xs:choice in '" + ctx + "' has two branches of the same C++ type ('" + r.cpp +
+        note("xs:choice in '" + ctx.ptr + "' has two branches of the same C++ type ('" + r.cpp +
              "'); the choice was skipped (std::variant needs distinct types)");
         return;
       }
       types.push_back(r.cpp);
       alts.push_back("xmlight::alt<" + r.cpp + ">(\"" + el.name + "\")");
+      // std::variant instantiates every alternative, so a branch struct must be
+      // complete here even when the variant itself sits inside a vector.
+      if (r.is_struct) {
+        deps.push_back(r.cpp);
+      }
     }
     if (types.empty()) {
       return;
@@ -811,11 +888,14 @@ class Generator {
       return f.metadata.find("variantField(") != std::string::npos;
     }));
     const std::string mem = prior == 0 ? "choice" : std::format("choice{}", prior + 1);
-    out.push_back({member_type + " " + mem + ";",
-                   "xmlight::variantField(&" + ctx + "::" + mem + "," + alts_joined + ")"});
+    out.push_back(
+        {.member = member_type + " " + mem + ";",
+         .name = mem,
+         .metadata = "xmlight::variantField(&" + ctx.ptr + "::" + mem + "," + alts_joined + ")",
+         .deps = std::move(deps)});
   }
 
-  auto expandAttrGroups(const std::string& ctx, std::span<const AttributeGroupRef> refs,
+  auto expandAttrGroups(const FieldCtx& ctx, std::span<const AttributeGroupRef> refs,
                         std::vector<FieldOut>& out) -> void {
     for (const auto& agr : refs) {
       const std::string ref_key{detail::localName(agr.ref)};
@@ -829,8 +909,7 @@ class Generator {
     }
   }
 
-  auto expandGroupRef(const std::string& ctx, const GroupRef& gr,
-                      std::vector<FieldOut>& out) -> void {
+  auto expandGroupRef(const FieldCtx& ctx, const GroupRef& gr, std::vector<FieldOut>& out) -> void {
     const std::string ref_key{detail::localName(gr.ref)};
     if (auto it = named_groups_.find(ref_key); it != named_groups_.end()) {
       const GroupDef& gd = *it->second;
@@ -850,14 +929,13 @@ class Generator {
     }
   }
 
-  // Appends the own (non-inherited) fields of a complexType to out. ctx is the
-  // C++ struct name used for pointer-to-member references in metadata.
-  auto ownFieldsOf(const std::string& ctx, const ComplexType& ct,
-                   std::vector<FieldOut>& out) -> void {
+  // Appends the own (non-inherited) fields of a complexType to out.
+  auto ownFieldsOf(const FieldCtx& ctx, const ComplexType& ct, std::vector<FieldOut>& out) -> void {
     const Content c = contentOf(ct);
     if (c.simple != nullptr) {
-      out.push_back(
-          {baseBuiltin(c.simple->base) + " value{};", "xmlight::valueField(&" + ctx + "::value)"});
+      out.push_back({.member = baseBuiltin(c.simple->base) + " value{};",
+                     .name = "value",
+                     .metadata = "xmlight::valueField(&" + ctx.ptr + "::value)"});
     }
     for (const auto& a : c.attributes) {
       addAttrField(ctx, a, out);
@@ -879,10 +957,11 @@ class Generator {
     }
   }
 
-  // Appends the inherited fields from the complexContent extension chain,
-  // each marked inherited=true. Uses ctx for pointer-to-member names so that
-  // &Child::inherited_field is emitted (valid C++ via derived-class access).
-  auto appendInheritedFields(const std::string& ctx, const ComplexType& ct,
+  // Appends the inherited fields from the complexContent extension chain, each
+  // marked inherited=true. The pointer-to-member names stay on the derived
+  // struct so &Child::inherited_field is emitted (valid C++ via derived-class
+  // access), while member names follow the base that declares them.
+  auto appendInheritedFields(const std::string& derived, const ComplexType& ct,
                              std::vector<FieldOut>& out) -> void {
     if (!ct.complex_content || !ct.complex_content->extension) {
       return;
@@ -892,9 +971,9 @@ class Generator {
     if (it == named_complex_.end()) {
       return;
     }
-    appendInheritedFields(ctx, *it->second, out);
+    appendInheritedFields(derived, *it->second, out);
     const size_t first_own = out.size();
-    ownFieldsOf(ctx, *it->second, out);
+    ownFieldsOf({.ptr = derived, .owner = detail::capitalize(base_key)}, *it->second, out);
     for (size_t i = first_own; i < out.size(); ++i) {
       out[i].inherited = true;
     }
@@ -905,7 +984,7 @@ class Generator {
   auto buildFields(const StructDef& s) -> std::vector<FieldOut> {
     std::vector<FieldOut> result;
     appendInheritedFields(s.cpp_name, *s.ct, result);
-    ownFieldsOf(s.cpp_name, *s.ct, result);
+    ownFieldsOf({.ptr = s.cpp_name, .owner = s.cpp_name}, *s.ct, result);
     return result;
   }
 
@@ -969,15 +1048,59 @@ class Generator {
     out_ += "  });\n};\n\n";
   }
 
+  // Member names that name a generated type, mapped to the elaborated-specifier
+  // keyword that gets past the hiding. Inherited members hide names in the
+  // derived scope too, so the whole field list is considered.
+  auto hiddenTypeNames(const StructDef& s) const -> std::unordered_map<std::string, std::string> {
+    std::unordered_map<std::string, std::string> hidden;
+    for (const auto& f : s.fields) {
+      if (emitted_.contains(f.name)) {
+        hidden.emplace(f.name, "struct ");
+      } else if (enum_names_.contains(f.name)) {
+        hidden.emplace(f.name, "enum ");
+      }
+    }
+    return hidden;
+  }
+
+  // A member declaration hides same-named types from every member after it, so
+  // a later member of such a type is written in elaborated form ("struct Foo
+  // bar;"). The member's own identifier is left alone: it is not in scope until
+  // its declarator ends.
+  static auto elaborateHidden(const FieldOut& f,
+                              const std::unordered_map<std::string, std::string>& hidden)
+      -> std::string {
+    std::string out;
+    for (size_t i = 0; i < f.member.size();) {
+      if (!detail::isIdentStart(f.member[i])) {
+        out.push_back(f.member[i++]);
+        continue;
+      }
+      const size_t start = i;
+      while (i < f.member.size() && detail::isIdentChar(f.member[i])) {
+        ++i;
+      }
+      const std::string id = f.member.substr(start, i - start);
+      if (id != f.name) {
+        if (const auto it = hidden.find(id); it != hidden.end()) {
+          out += it->second;
+        }
+      }
+      out += id;
+    }
+    return out;
+  }
+
   auto emitStructDef(const StructDef& s) -> void {
     out_ += "struct " + s.cpp_name;
     if (!s.parent_xsd.empty()) {
       out_ += " : " + detail::capitalize(s.parent_xsd);
     }
     out_ += " {\n";
+    const auto hidden = hiddenTypeNames(s);
     for (const auto& f : s.fields) {
       if (!f.inherited && !f.member.empty()) {
-        out_ += "  " + f.member + "\n";
+        out_ += "  " + (hidden.empty() ? f.member : elaborateHidden(f, hidden)) + "\n";
       }
     }
     out_ += "};\n\n";
@@ -1006,6 +1129,34 @@ class Generator {
 
   static auto isStringCpp(const std::string& cpp) -> bool {
     return cpp == "std::string" || cpp == "std::string_view";
+  }
+
+  // XSD's regex flavour has constructs ECMAScript lacks: the \i \I \c \C name
+  // classes, \p{...} / \P{...} categories, and character-class subtraction
+  // ([a-z-[aeiou]]). std::regex reads those as something else entirely, so a
+  // pattern carrying one is reported rather than enforced as a different rule.
+  static auto isEcmaPattern(std::string_view pattern) -> bool {
+    static constexpr std::string_view k_xsd_escapes = "iIcCpP";
+    bool in_class = false;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+      if (pattern[i] == '\\') {
+        if (i + 1 < pattern.size() &&
+            k_xsd_escapes.find(pattern[i + 1]) != std::string_view::npos) {
+          return false;
+        }
+        ++i;
+        continue;
+      }
+      if (pattern[i] == '[') {
+        if (in_class) {
+          return false;  // a class opening inside a class is subtraction
+        }
+        in_class = true;
+      } else if (pattern[i] == ']') {
+        in_class = false;
+      }
+    }
+    return true;
   }
 
   static auto escapeStrLiteral(const std::string& s) -> std::string {
@@ -1073,10 +1224,15 @@ class Generator {
                 "length violation (expected=" + r.length->value + ")");
       }
       if (r.pattern && !r.pattern->value.empty()) {
-        needs_regex_ = true;
-        out += "    { static const std::regex pat(\"" + escapeStrLiteral(r.pattern->value) +
-               "\"); if (" + g + "!std::regex_match(" + val + ", pat)) return \"" + mem +
-               ": pattern violation\"; }\n";
+        if (isEcmaPattern(r.pattern->value)) {
+          needs_regex_ = true;
+          out += "    { static const std::regex pat(\"" + escapeStrLiteral(r.pattern->value) +
+                 "\"); if (" + g + "!std::regex_match(" + val + ", pat)) return \"" + mem +
+                 ": pattern violation\"; }\n";
+        } else {
+          note("pattern '" + r.pattern->value +
+               "' uses XSD-only regex syntax; the constraint is not enforced");
+        }
       }
     } else {
       if (r.min_inclusive && !r.min_inclusive->value.empty()) {
@@ -1099,14 +1255,32 @@ class Generator {
     return out;
   }
 
+  // XmlConstraints is looked up on the static type, so a derived struct has to
+  // repeat the checks its bases declare. Base first, matching the field order.
   auto structConstraintBody(const StructDef& s) -> std::string {
-    std::string body;
-    const ComplexType& ct = *s.ct;
+    return chainConstraintBody(s.cpp_name, *s.ct, s.cpp_name);
+  }
 
-    auto process_attr = [this, &body](const Attribute& a) {
-      const std::string mem = detail::sanitize(a.name);
+  auto chainConstraintBody(const std::string& derived, const ComplexType& ct,
+                           const std::string& owner) -> std::string {
+    std::string body;
+    if (ct.complex_content && ct.complex_content->extension) {
+      const std::string base_key{detail::localName(ct.complex_content->extension->base)};
+      if (const auto it = named_complex_.find(base_key); it != named_complex_.end()) {
+        body += chainConstraintBody(derived, *it->second, detail::capitalize(base_key));
+      }
+    }
+    return body + ownConstraintBody(ct, owner);
+  }
+
+  auto ownConstraintBody(const ComplexType& ct, const std::string& owner) -> std::string {
+    std::string body;
+    const FieldCtx ctx{.ptr = owner, .owner = owner};
+
+    auto process_attr = [this, &body, &ctx](const Attribute& a) {
+      const Resolved res = resolveAttrType(a);
+      const std::string mem = memberName(ctx, a.name, res.cpp);
       if (!a.fixed.empty()) {
-        const Resolved res = resolveAttrType(a);
         // Custom value types (xmlight::Date etc.) have no literal spelling; the
         // dropped-initializer note was already emitted by addAttrField.
         if (isStringCpp(res.cpp)) {
@@ -1127,10 +1301,11 @@ class Generator {
       if (r == nullptr) {
         return;
       }
-      body += buildCheckCode(mem, resolveAttrType(a).cpp, false, *r);
+      body += buildCheckCode(mem, res.cpp, false, *r);
     };
-    auto process_element = [this, &body](const Element& el) {
-      const std::string mem = detail::sanitize(el.name);
+    auto process_element = [this, &body, &ctx](const Element& el) {
+      const Resolved res = resolveElementType(el);
+      const std::string mem = memberName(ctx, el.name, res.cpp);
       if (const auto n = finiteMaxOccurs(el)) {
         body +=
             std::format("    if (v.{}.size() > {}) return \"{}: maxOccurs violation (max={})\";\n",
@@ -1143,7 +1318,7 @@ class Generator {
       if (r == nullptr) {
         return;
       }
-      body += buildCheckCode(mem, resolveElementType(el).cpp, minOccursOf(el) == 0, *r);
+      body += buildCheckCode(mem, res.cpp, minOccursOf(el) == 0, *r);
     };
 
     // Choice branches live in a std::variant member, not in members named
@@ -1192,9 +1367,10 @@ class Generator {
     constraints_out_ += "    return {};\n  }\n};\n\n";
   }
 
-  // Topologically order structs so a by-value/optional member's type is defined
-  // first. Inherited fields are skipped; the parent is already collected before
-  // the child by collectComplexType.
+  // Topologically order structs so every type that has to be complete where a
+  // struct is defined - its base class, its by-value and optional members, and
+  // its variant alternatives - is defined first. Inherited fields are skipped:
+  // they are declared by the base, which is itself a dependency.
   auto orderStructs() -> void {
     std::unordered_map<std::string, size_t> index;
     for (size_t i = 0; i < structs_.size(); ++i) {
@@ -1203,17 +1379,20 @@ class Generator {
 
     std::vector<std::vector<size_t>> deps(structs_.size());
     for (size_t i = 0; i < structs_.size(); ++i) {
+      const auto add = [&deps, &index, i](const std::string& name) {
+        if (const auto it = index.find(name); it != index.end() && it->second != i) {
+          deps[i].push_back(it->second);
+        }
+      };
+      if (!structs_[i].parent_xsd.empty()) {
+        add(detail::capitalize(structs_[i].parent_xsd));
+      }
       for (const auto& f : structs_[i].fields) {
         if (f.inherited) {
           continue;
         }
-        if (f.member.starts_with("std::vector<") || f.member.starts_with("std::unique_ptr<")) {
-          continue;
-        }
-        for (const auto& [name, j] : index) {
-          if (j != i && memberReferences(f.member, name)) {
-            deps[i].push_back(j);
-          }
+        for (const auto& dep : f.deps) {
+          add(dep);
         }
       }
     }
@@ -1239,11 +1418,6 @@ class Generator {
     structs_ = std::move(ordered);
   }
 
-  static auto memberReferences(const std::string& member, const std::string& type) -> bool {
-    const std::string opt = "std::optional<" + type + ">";
-    return member.starts_with(type + " ") || member.starts_with(opt);
-  }
-
   const Schema& schema_;
   std::unordered_map<std::string, const ComplexType*> named_complex_;
   std::unordered_map<std::string, const SimpleType*> named_simple_;
@@ -1251,6 +1425,7 @@ class Generator {
   std::unordered_map<std::string, const GroupDef*> named_groups_;
   std::vector<StructDef> structs_;
   std::vector<EnumDef> enums_;
+  std::unordered_set<std::string> enum_names_;
   std::unordered_set<std::string> emitted_;
   std::unordered_set<std::string> used_names_;
   std::vector<std::string> notes_;
@@ -1265,7 +1440,10 @@ class Generator {
 /// @param opts Options including an optional include-file loader callback.
 [[nodiscard]] inline auto generate(std::string_view xsd_text,
                                    const Options& opts = {}) -> GenResult {
-  xmlight::Parser parser{xsd_text};
+  // Normalizing: schema text carries character references (UCI writes its
+  // pattern facets with &#x20;), and a raw pattern would compile into a regex
+  // matching the reference itself.
+  xmlight::NormalizingParser parser{xsd_text};
   Schema schema;
   if (!xmlight::deserialize(parser, "schema", schema)) {
     GenResult r;
@@ -1293,7 +1471,7 @@ class Generator {
       if (!src) {
         continue;
       }
-      xmlight::Parser ip{*src};
+      xmlight::NormalizingParser ip{*src};
       Schema included;
       if (!xmlight::deserialize(ip, "schema", included)) {
         continue;

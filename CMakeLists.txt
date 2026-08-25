@@ -18,10 +18,21 @@ option(LIGHTNINGXML_WITH_PUGIXML       "Build pugixml comparison benchmarks"    
 option(LIGHTNINGXML_WITH_RAPIDXML      "Build RapidXML comparison benchmarks (via Boost)"       OFF)
 option(LIGHTNINGXML_WITH_LIBXML2       "Build libxml2 comparison benchmarks"                    OFF)
 option(LIGHTNINGXML_BUILD_FUZZERS      "Build libFuzzer targets (requires Clang)"               OFF)
+option(LIGHTNINGXML_WITH_UCI           "Build the optional OMS UCI v2.5 schema add-on"          ON)
 option(LIGHTNINGXML_ENABLE_SANITIZERS  "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 option(LIGHTNINGXML_ENABLE_COVERAGE    "Enable gcov coverage instrumentation"                   OFF)
 option(LIGHTNINGXML_ENABLE_UNITY_BUILD "Compile executables as unity builds"                    ON)
 option(LIGHTNINGXML_ENABLE_LTO         "Enable link-time optimization (IPO) for executables"    ON)
+
+set(LIGHTNINGXML_UCI_SCHEMA_DIR "" CACHE PATH
+    "Directory holding the UCI v2.5 XSDs; skips the download when set"
+)
+
+# The UCI add-on is generated output, so it needs the generator.
+if(LIGHTNINGXML_WITH_UCI AND NOT LIGHTNINGXML_BUILD_CODEGEN)
+    message(STATUS "LightningXML: UCI add-on requires xsdgen; enabling LIGHTNINGXML_BUILD_CODEGEN")
+    set(LIGHTNINGXML_BUILD_CODEGEN ON)
+endif()
 
 # Coverage wants unoptimized, non-LTO
 if(LIGHTNINGXML_ENABLE_COVERAGE)
@@ -273,6 +284,10 @@ if(LIGHTNINGXML_BUILD_TESTS AND LIGHTNINGXML_BUILD_CODEGEN)
     target_include_directories(lightningxml_tests PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 endif()
 
+if(LIGHTNINGXML_WITH_UCI)
+    add_subdirectory(extras/uci)
+endif()
+
 # ---- Installation & package config ----
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -298,7 +313,7 @@ endif()
 
 # Developer convenience: copy the test/bench/codegen binaries into <source>/bin.
 set(INSTALL_DIR "${CMAKE_SOURCE_DIR}/bin")
-foreach(_target lightningxml_tests lightningxml_bench lightningxml_xsdgen)
+foreach(_target lightningxml_tests lightningxml_bench lightningxml_xsdgen lightningxml_uci_tests)
     if(TARGET ${_target})
         install(TARGETS ${_target} DESTINATION ${INSTALL_DIR})
     endif()

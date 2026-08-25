@@ -1141,13 +1141,17 @@ constexpr auto makeNextElemTable() noexcept {
   constexpr auto kinds = makeFieldKinds<T>();
   constexpr size_t n = kinds.size();
   std::array<size_t, (n != 0 ? n : 1)> next{};
-  for (size_t i = 0; i < n; ++i) {
-    next[i] = i;
-    for (size_t step = 1; step <= n; ++step) {
-      const size_t j = (i + step) % n;
-      if (isElementKind(kinds[j])) {
-        next[i] = j;
-        break;
+  // Discarded for a fieldless type: the wrap-around would read as a remainder
+  // by zero even though the loop never runs.
+  if constexpr (n != 0) {
+    for (size_t i = 0; i < n; ++i) {
+      next[i] = i;
+      for (size_t step = 1; step <= n; ++step) {
+        const size_t j = (i + step) % n;
+        if (isElementKind(kinds[j])) {
+          next[i] = j;
+          break;
+        }
       }
     }
   }

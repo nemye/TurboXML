@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.1 - 2026-08-25
+
+### Added
+- Optional OMS UCI v2.5 add-on (`LIGHTNINGXML_WITH_UCI`): fetches the published schema at a pinned, SHA256-checked commit, generates the whole message set (722 messages, 4,612 types, 725 enums), and tests it against hand-written UCI documents. `LIGHTNINGXML_UCI_SCHEMA_DIR` builds it offline from a local copy
+- `xsdgen` reads the schema with `NormalizingParser`
+
+### Fixed
+- `xsdgen` emitted a derived struct before its base, and a `std::variant` member before the alternatives it instantiates, whenever the type was first reached as another type's member. The ordering pass now takes the base and every variant alternative as dependencies (and no longer scans every struct name per field)
+- `xsdgen` value-initialized struct members (`Inner inner{};`), which instantiates the member's destructor and so required every type it holds in a vector to be complete at that point. Struct members are declared without an initializer
+- `xsdgen` emitted members that repeat the name of the struct declaring them or of their own type, and members that hide a type name used by a later member; these now take a trailing `_` or the elaborated form, with the XML name unchanged
+- `xsdgen` emitted enumerators and members spelled like C standard-library or GoogleTest macros (`SIGINT`, `NULL`, `TEST`, `FAIL`, ...); they take a trailing `_` so including the header after `<csignal>` or `<gtest/gtest.h>` compiles
+- Facet constraints on inherited members were not checked: `XmlConstraints<T>` is selected by static type, so a derived type now repeats its bases' checks
+- Pattern facets using XSD-only regex syntax (`\i`, `\c`, `\p{...}`, class subtraction) were compiled into `std::regex` as a different rule; they are reported and left unenforced
+- `makeNextElemTable()` read as a remainder by zero for a type with no fields, which warned under `-Wdivision-by-zero` even though the loop never ran
+
 ## 1.3.0 - 2026-08-14
 
 ### Fixed

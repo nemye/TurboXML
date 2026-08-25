@@ -1,0 +1,53 @@
+name: UCI Add-On
+
+# Kept off the per-push matrix: this job downloads 8.6 MB of schema at configure
+# time and compiles a ~4.7 MB generated translation unit (minutes, several GB).
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+
+  uci:
+    name: UCI v2.5 generate and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build clang
+
+      - name: Configure
+        env:
+          CC: clang
+          CXX: clang++
+        run: |
+          cmake \
+            -S . \
+            -B build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLIGHTNINGXML_BUILD_TESTS=ON \
+            -DLIGHTNINGXML_BUILD_BENCHMARKS=OFF \
+            -DLIGHTNINGXML_WITH_UCI=ON
+
+      # One translation unit dominates the build; -j1 keeps peak memory in reach
+      # of a standard runner.
+      - name: Build
+        run: |
+          cmake --build build --target lightningxml_uci_tests --parallel 1
+
+      - name: Run tests
+        run: |
+          ctest \
+            --test-dir build \
+            --output-on-failure \
+            -R Uci
